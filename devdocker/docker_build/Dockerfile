@@ -40,7 +40,7 @@ RUN conda install -y numpy pytorch torchvision pytorch-cuda=12.4 ffmpeg -c pytor
 
 RUN pip install plyfile tqdm open3d mediapy lpips trimesh scikit-image scikit-learn \
     opencv-python pynvml matplotlib pandas psutil tensorboard einops vtk roma hydra-core "imageio[ffmpeg]" \
-    gym stable-baselines3
+    stable-baselines3 "gymnasium[other,classic-control]"
 RUN conda install conda-forge::cgal
 RUN conda install tbb-devel
 
