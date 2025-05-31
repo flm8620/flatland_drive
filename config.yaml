@@ -10,11 +10,11 @@ env:
   v_max: 5.0
   w_cost: 1.0
   w_col: 1.0
-  R_goal: 50.0
+  R_goal: 100.0
   disk_radius: 2.0
   render_dir: ${hydra:run.dir}/viz
   video_fps: 30
-  w_dist: 1.0
+  w_dist: 50.0
   w_accel: 0.1
   save_viz: true
 
