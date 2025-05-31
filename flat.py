@@ -1,3 +1,29 @@
+'''
+We want to create a Renforcement Learning Playground project. 
+In this project, I want to train a network for autonomous driving. 
+To simplify the task, I will assume each agent (car) is a disk in 2D world. 
+And the driver can only control the acceleration vector in x y plane for each frame. 
+The acceleration vector's norm should be limited not to exceed a maximum value.
+
+And for the 2D world map, I think maybe we can simply generate a large random texture as a maze-like map. 
+Each pixel has a value. value 0 means drivable, i.e. driving on it will not cause any punishment. 
+
+For other positive values, driving on it per frame will cause punishment proportional to this value. 
+So the agent should avoid driving on high value pixels.
+
+For the target, there should be a clear marker on the map indicating the target. 
+When reaching the target, the agent will get a large reward.
+
+And what I want also train is the ability to avoid crashing on other agent. 
+So if two agent is crashing on to each other, 
+each of the agent will suffer a punishment proportional to the relative speed of crash.
+
+And I want the entire project mainly written in pytorch. 
+For the map generation and rendering, you can use other lib, 
+for example OpenGL or Vulkan or other libs. 
+The network should only take the current BEV image as input, together with current speed vector.
+'''
+
 import os
 import numpy as np
 import cv2
