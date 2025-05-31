@@ -11,6 +11,7 @@ from collections import deque
 import random
 from opensimplex import OpenSimplex
 
+
 ##########################
 # 1. Environment
 ##########################
@@ -26,7 +27,6 @@ class DrivingEnv(gym.Env):
     metadata = {'render.modes': []}
 
     def __init__(self,
-                 map_size=(256, 256),
                  view_size=64,
                  dt=0.1,
                  a_max=1.0,
@@ -38,7 +38,7 @@ class DrivingEnv(gym.Env):
                  disk_radius=2.0,
                  render_dir=None):
         super().__init__()
-        self.map_h, self.map_w = map_size
+        self.map_h, self.map_w = 512, 512
         self.view_size = view_size
         self.dt = dt
         self.a_max = a_max
@@ -56,12 +56,16 @@ class DrivingEnv(gym.Env):
             self.frame_count = 0
 
         # Action: 2-d acceleration
-        self.action_space = spaces.Box(low=-a_max, high=a_max, shape=(2,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-a_max,
+                                       high=a_max,
+                                       shape=(2, ),
+                                       dtype=np.float32)
 
         # Obs: image + velocity
-        self.observation_space = spaces.Box(
-            low=0.0, high=1.0,
-            shape=(3, view_size, view_size), dtype=np.float32)
+        self.observation_space = spaces.Box(low=0.0,
+                                            high=1.0,
+                                            shape=(3, view_size, view_size),
+                                            dtype=np.float32)
         # we'll concatenate flattened vel channels at right-most pixels
 
         # Generate cost map and target
@@ -87,20 +91,34 @@ class DrivingEnv(gym.Env):
             xs = np.arange(self.map_w)
             ys = np.arange(self.map_h)
             grid_x, grid_y = np.meshgrid(xs, ys)
-            M = np.vectorize(lambda i, j: simplex.noise2d(i / perlin_scale,
-                                                         j / perlin_scale))(grid_y, grid_x)
+            M = np.vectorize(lambda i, j: simplex.noise2d(
+                i / perlin_scale, j / perlin_scale))(grid_y, grid_x)
             M = M.astype(np.float32)
         else:
             rng = np.random.RandomState(self._seed)
             M = rng.rand(self.map_h, self.map_w).astype(np.float32)
-            M = cv2.GaussianBlur(M, (0, 0), sigmaX=5, sigmaY=5)
-        # Normalize to [0,1]
-        M -= M.min()
-        M /= (M.max() - M.min() + 1e-8)
+            # set border to strong positive value as world border
+            BORDER_VALUE = 1.5
+            M[0, :] = BORDER_VALUE
+            M[-1, :] = BORDER_VALUE
+            M[:, 0] = BORDER_VALUE
+            M[:, -1] = BORDER_VALUE
+            M -= 0.5
+            M *= 10
+            M = cv2.GaussianBlur(M, (0, 0), sigmaX=10, sigmaY=10)
 
-        # 2) Thresholding to get drivable mask
-        T = 0.5
-        drivable = (M <= T)
+            T = 0.0
+            COST_MAX = 0.2
+            drivable = (M <= T)
+            M[M > COST_MAX] = COST_MAX
+            # save M to tiff file
+            cv2.imwrite(os.path.join(self.render_dir, 'M_map.tiff'), M)
+            self.cost_map = np.zeros_like(M)
+            mask = ~drivable
+            self.cost_map[mask] = (M[mask] - T) / (COST_MAX - T)
+            cv2.imwrite(os.path.join(self.render_dir, 'cost_map.tiff'), M)
+
+        drivable = self.cost_map == 0
 
         # 3) Enforce minimum width by eroding drivable mask
         kernel_size = 2 * corridor_width + 1
@@ -111,10 +129,10 @@ class DrivingEnv(gym.Env):
         # 4) Pick a random target on eroded mask
         ys_e, xs_e = np.where(eroded)
         if len(xs_e) < 2:
-            raise RuntimeError("Not enough wide drivable area to place start and target")
-        
-        
-        best_pair = None      # will store (tx, ty, sx, sy)
+            raise RuntimeError(
+                "Not enough wide drivable area to place start and target")
+
+        best_pair = None  # will store (tx, ty, sx, sy)
         best_dist = -1
         chosen = False
 
@@ -129,8 +147,8 @@ class DrivingEnv(gym.Env):
             visited[ty_c, tx_c] = True
             while queue:
                 y0, x0 = queue.popleft()
-                for dy, dx in [(1,0),(-1,0),(0,1),(0,-1)]:
-                    ny, nx = y0+dy, x0+dx
+                for dy, dx in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                    ny, nx = y0 + dy, x0 + dx
                     if 0 <= ny < self.map_h and 0 <= nx < self.map_w \
                     and eroded[ny, nx] and not visited[ny, nx]:
                         visited[ny, nx] = True
@@ -138,7 +156,7 @@ class DrivingEnv(gym.Env):
 
             pts = np.argwhere(visited)
             # drop the target itself
-            pts = pts[~((pts[:,0] == ty_c) & (pts[:,1] == tx_c))]
+            pts = pts[~((pts[:, 0] == ty_c) & (pts[:, 1] == tx_c))]
             if len(pts) == 0:
                 continue
 
@@ -168,11 +186,6 @@ class DrivingEnv(gym.Env):
         self.start = np.array([sx, sy], dtype=np.int32)
         self.target = np.array([tx, ty], dtype=np.int32)
 
-        # 7) Build cost_map: zero cost on original drivable, scaled cost elsewhere
-        self.cost_map = np.zeros_like(M)
-        mask = ~drivable
-        self.cost_map[mask] = (M[mask] - T) / (1 - T)
-    
     def visualize_map(self, filename='map.png'):
         """
         Write an RGB visualization of the entire cost_map to render_dir:
@@ -182,22 +195,31 @@ class DrivingEnv(gym.Env):
         """
         if not self.render_dir:
             return
-        h,w = self.cost_map.shape
-        vis = np.zeros((h,w,3),dtype=np.uint8)
+        h, w = self.cost_map.shape
+        vis = np.zeros((h, w, 3), dtype=np.uint8)
         # drivable mask
         drivable = (self.cost_map == 0)
         # white for drivable
-        vis[drivable] = [255,255,255]
+        vis[drivable] = [255, 255, 255]
         # color cost
         idx = np.where(~drivable)
-        costs = np.clip(self.cost_map[idx],0,1)
+        costs = np.clip(self.cost_map[idx], 0, 1)
         # BGR: blue->red
-        vis[idx] = np.stack([ (255*(1-costs)).astype(np.uint8),
-                              np.zeros_like(costs, dtype=np.uint8),
-                              (255*costs).astype(np.uint8) ], axis=1)
+        vis[idx] = np.stack([(255 * (1 - costs)).astype(np.uint8),
+                             np.zeros_like(costs, dtype=np.uint8),
+                             (255 * costs).astype(np.uint8)],
+                            axis=1)
         # draw points
-        cv2.circle(vis, tuple(self.start), radius=5, color=(0,255,0), thickness=-1)
-        cv2.circle(vis, tuple(self.target), radius=5, color=(0,0,255), thickness=-1)
+        cv2.circle(vis,
+                   tuple(self.start),
+                   radius=5,
+                   color=(0, 255, 0),
+                   thickness=-1)
+        cv2.circle(vis,
+                   tuple(self.target),
+                   radius=5,
+                   color=(0, 0, 255),
+                   thickness=-1)
         path = os.path.join(self.render_dir, filename)
         cv2.imwrite(path, vis)
 
@@ -245,8 +267,10 @@ class DrivingEnv(gym.Env):
         # crop view
         x, y = self.pos
         half = self.view_size // 2
-        x0 = int(x) - half; x1 = x0 + self.view_size
-        y0 = int(y) - half; y1 = y0 + self.view_size
+        x0 = int(x) - half
+        x1 = x0 + self.view_size
+        y0 = int(y) - half
+        y1 = y0 + self.view_size
         # pad
         pad_x0, pad_y0 = max(0, -x0), max(0, -y0)
         pad_x1, pad_y1 = max(0, x1 - self.map_w), max(0, y1 - self.map_h)
@@ -263,7 +287,8 @@ class DrivingEnv(gym.Env):
         if x0 <= tx < x1 and y0 <= ty < y1:
             tx_rel = int(tx - x0)
             ty_rel = int(ty - y0)
-            cv2.circle(target_map, (tx_rel, ty_rel), int(self.disk_radius), 1.0, -1)
+            cv2.circle(target_map, (tx_rel, ty_rel), int(self.disk_radius),
+                       1.0, -1)
         return np.stack([view, vel_map, target_map], axis=0)
 
     def render(self):
@@ -272,35 +297,47 @@ class DrivingEnv(gym.Env):
             return
         img = self._get_obs()[0]
         img = (img * 255).astype(np.uint8)
-        path = os.path.join(self.render_dir, f'frame_{self.frame_count:06d}.png')
+        path = os.path.join(self.render_dir,
+                            f'frame_{self.frame_count:06d}.png')
         cv2.imwrite(path, img)
         self.frame_count += 1
+
 
 ##########################
 # 2. Replay Buffer
 ##########################
 class ReplayBuffer:
+
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
+
     def push(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
+
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
         return np.stack(states), np.stack(actions), np.array(rewards, dtype=np.float32), \
                np.stack(next_states), np.array(dones, dtype=np.float32)
-    def __len__(self): return len(self.buffer)
+
+    def __len__(self):
+        return len(self.buffer)
+
 
 ##########################
 # 3. Networks
 ##########################
 class ConvEncoder(nn.Module):
+
     def __init__(self, view_size):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(3, 32, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.ReLU(),
         )
         self.fc_in = 128 * (view_size // 8) * (view_size // 8)
 
@@ -308,14 +345,14 @@ class ConvEncoder(nn.Module):
         x = self.net(x)
         return x.view(x.size(0), -1)
 
+
 class Actor(nn.Module):
+
     def __init__(self, view_size, action_dim=2):
         super().__init__()
         self.encoder = ConvEncoder(view_size)
-        self.net = nn.Sequential(
-            nn.Linear(self.encoder.fc_in, 256), nn.ReLU(),
-            nn.Linear(256, action_dim)
-        )
+        self.net = nn.Sequential(nn.Linear(self.encoder.fc_in, 256), nn.ReLU(),
+                                 nn.Linear(256, action_dim))
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
     def forward(self, obs):
@@ -326,26 +363,29 @@ class Actor(nn.Module):
         dist = torch.distributions.Normal(mu, std)
         return dist
 
+
 class Critic(nn.Module):
+
     def __init__(self, view_size, action_dim=2):
         super().__init__()
         self.encoder = ConvEncoder(view_size)
         self.net = nn.Sequential(
             nn.Linear(self.encoder.fc_in + action_dim, 256), nn.ReLU(),
-            nn.Linear(256, 1)
-        )
+            nn.Linear(256, 1))
 
     def forward(self, obs, action):
         h = self.encoder(obs)
         x = torch.cat([h, action], dim=1)
         return self.net(x)
 
+
 ##########################
 # 4. SAC Trainer
 ##########################
 def soft_update(net, target_net, tau):
     for p, tp in zip(net.parameters(), target_net.parameters()):
-        tp.data.mul_(1 - tau); tp.data.add_(tau * p.data)
+        tp.data.mul_(1 - tau)
+        tp.data.add_(tau * p.data)
 
 
 def train():
@@ -387,7 +427,9 @@ def train():
             done = terminated or truncated
             env.render()
             replay.push(obs.cpu().numpy()[0], action, r, next_obs, done)
-            obs = torch.tensor(next_obs[None], dtype=torch.float32, device=device)
+            obs = torch.tensor(next_obs[None],
+                               dtype=torch.float32,
+                               device=device)
             ep_reward += r
 
             # update
@@ -395,9 +437,11 @@ def train():
                 s, a, rew, s2, d = replay.sample(batch_size)
                 s = torch.tensor(s, dtype=torch.float32, device=device)
                 a = torch.tensor(a, dtype=torch.float32, device=device)
-                rew = torch.tensor(rew, dtype=torch.float32, device=device).unsqueeze(1)
+                rew = torch.tensor(rew, dtype=torch.float32,
+                                   device=device).unsqueeze(1)
                 s2 = torch.tensor(s2, dtype=torch.float32, device=device)
-                d = torch.tensor(d, dtype=torch.float32, device=device).unsqueeze(1)
+                d = torch.tensor(d, dtype=torch.float32,
+                                 device=device).unsqueeze(1)
 
                 # critics update
                 with torch.no_grad():
@@ -413,8 +457,12 @@ def train():
                 q2 = critic2(s, a)
                 loss_q1 = F.mse_loss(q1, y)
                 loss_q2 = F.mse_loss(q2, y)
-                opt_critic1.zero_grad(); loss_q1.backward(); opt_critic1.step()
-                opt_critic2.zero_grad(); loss_q2.backward(); opt_critic2.step()
+                opt_critic1.zero_grad()
+                loss_q1.backward()
+                opt_critic1.step()
+                opt_critic2.zero_grad()
+                loss_q2.backward()
+                opt_critic2.step()
 
                 # actor update
                 dist_curr = actor(s)
@@ -423,7 +471,9 @@ def train():
                 q1_pi = critic1(s, a_curr)
                 q2_pi = critic2(s, a_curr)
                 loss_pi = (alpha * logp - torch.min(q1_pi, q2_pi)).mean()
-                opt_actor.zero_grad(); loss_pi.backward(); opt_actor.step()
+                opt_actor.zero_grad()
+                loss_pi.backward()
+                opt_actor.step()
 
                 # soft updates
                 soft_update(critic1, target_critic1, tau)
@@ -437,6 +487,7 @@ def train():
         if ep % 50 == 0:
             torch.save(actor.state_dict(), f"actor_ep{ep}.pth")
             torch.save(critic1.state_dict(), f"critic1_ep{ep}.pth")
+
 
 if __name__ == '__main__':
     train()
