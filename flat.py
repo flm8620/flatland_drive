@@ -36,7 +36,8 @@ class DrivingEnv(gym.Env):
                  R_goal=50.0,
                  num_agents=1,
                  disk_radius=2.0,
-                 render_dir=None):
+                 render_dir=None,
+                 video_fps=30):
         super().__init__()
         self.map_h, self.map_w = 512, 512
         self.view_size = view_size
@@ -49,11 +50,13 @@ class DrivingEnv(gym.Env):
         self.disk_radius = disk_radius
         self.num_agents = num_agents
 
-        # Directory to dump frames if set
+        # Directory to dump frames or video if set
         self.render_dir = render_dir
+        self.video_fps = video_fps
+        self.episode_count = 0
+        self.video_writer = None
         if self.render_dir:
             os.makedirs(self.render_dir, exist_ok=True)
-            self.frame_count = 0
 
         # Action: 2-d acceleration
         self.action_space = spaces.Box(low=-a_max,
@@ -224,14 +227,24 @@ class DrivingEnv(gym.Env):
         cv2.imwrite(path, vis)
 
     def reset(self, *, seed=None, options=None):
-        # optionally reseed
-        self.seed(seed)
-        # sample start on drivable region
+        self.episode_count += 1
+        if seed is not None:
+            self.seed(seed)
         mask = (self.cost_map == 0)
         ys, xs = np.where(mask)
         idx = np.random.randint(len(xs))
         self.pos = np.array([xs[idx], ys[idx]], dtype=np.float32)
         self.vel = np.zeros(2, dtype=np.float32)
+        # Initialize video writer for this episode
+        if self.render_dir:
+            video_path = os.path.join(self.render_dir,
+                                      f'episode_{self.episode_count:03d}.mp4')
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(
+                video_path,
+                fourcc,
+                self.video_fps, (self.view_size, self.view_size),
+                isColor=False)
         obs = self._get_obs()
         return obs, {}
 
@@ -261,6 +274,15 @@ class DrivingEnv(gym.Env):
 
         obs = self._get_obs()
         reward = r_step + r_col + r_goal
+
+        # Render this step: write to video writer
+        if self.render_dir and self.video_writer is not None:
+            frame = (obs[0] * 255).astype(np.uint8)
+            self.video_writer.write(frame)
+            if terminated:
+                self.video_writer.release()
+                self.video_writer = None
+
         return obs, reward, terminated, False, {}
 
     def _get_obs(self):
@@ -290,17 +312,6 @@ class DrivingEnv(gym.Env):
             cv2.circle(target_map, (tx_rel, ty_rel), int(self.disk_radius),
                        1.0, -1)
         return np.stack([view, vel_map, target_map], axis=0)
-
-    def render(self):
-        # Dump BEV frames to disk if render_dir specified
-        if not self.render_dir:
-            return
-        img = self._get_obs()[0]
-        img = (img * 255).astype(np.uint8)
-        path = os.path.join(self.render_dir,
-                            f'frame_{self.frame_count:06d}.png')
-        cv2.imwrite(path, img)
-        self.frame_count += 1
 
 
 ##########################
@@ -389,7 +400,7 @@ def soft_update(net, target_net, tau):
 
 
 def train():
-    render_dir = 'frames'
+    render_dir = 'viz'
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env = DrivingEnv(render_dir=render_dir)
     replay = ReplayBuffer(100000)
@@ -425,14 +436,12 @@ def train():
                 action = dist.sample().cpu().numpy()[0]
             next_obs, r, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-            env.render()
             replay.push(obs.cpu().numpy()[0], action, r, next_obs, done)
             obs = torch.tensor(next_obs[None],
                                dtype=torch.float32,
                                device=device)
             ep_reward += r
 
-            # update
             if len(replay) > warmup:
                 s, a, rew, s2, d = replay.sample(batch_size)
                 s = torch.tensor(s, dtype=torch.float32, device=device)
@@ -443,7 +452,6 @@ def train():
                 d = torch.tensor(d, dtype=torch.float32,
                                  device=device).unsqueeze(1)
 
-                # critics update
                 with torch.no_grad():
                     dist_next = actor(s2)
                     a2 = dist_next.rsample()
