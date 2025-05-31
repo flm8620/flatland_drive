@@ -36,6 +36,12 @@ import torch.optim as optim
 from collections import deque
 import random
 from opensimplex import OpenSimplex
+import time
+# Hydra and TensorBoard imports
+from omegaconf import DictConfig, OmegaConf
+import hydra
+from hydra.utils import to_absolute_path
+from torch.utils.tensorboard import SummaryWriter
 
 
 ##########################
@@ -55,15 +61,17 @@ class DrivingEnv(gym.Env):
     def __init__(self,
                  view_size=64,
                  dt=0.1,
-                 a_max=1.0,
-                 v_max=2.0,
+                 a_max=2.0,
+                 v_max=5.0,
                  w_cost=1.0,
                  w_col=1.0,
                  R_goal=50.0,
                  num_agents=1,
                  disk_radius=2.0,
                  render_dir=None,
-                 video_fps=30):
+                 video_fps=30,
+                 w_dist=1.0,
+                 w_accel=0.1):
         super().__init__()
         self.map_h, self.map_w = 512, 512
         self.view_size = view_size
@@ -71,10 +79,12 @@ class DrivingEnv(gym.Env):
         self.a_max = a_max
         self.v_max = v_max
         self.w_cost = w_cost
+        self.w_dist = w_dist
         self.w_col = w_col
         self.R_goal = R_goal
         self.disk_radius = disk_radius
         self.num_agents = num_agents
+        self.w_accel = w_accel
 
         # Directory to dump frames or video if set
         self.render_dir = render_dir
@@ -91,17 +101,18 @@ class DrivingEnv(gym.Env):
                                        dtype=np.float32)
 
         # Obs: image + velocity
+        self.pyramid_scales = [1, 4, 16]
+        self.num_levels = len(self.pyramid_scales)
         self.observation_space = spaces.Box(low=0.0,
                                             high=1.0,
-                                            shape=(3, view_size, view_size),
+                                            shape=(self.num_levels, 3,
+                                                   view_size, view_size),
                                             dtype=np.float32)
         # we'll concatenate flattened vel channels at right-most pixels
 
-        # Generate cost map and target
         self.seed()
-        self._generate_map()
-        if self.render_dir:
-            self.visualize_map()
+
+        self.canvas_size = 256  # For human video rendering
 
     def seed(self, seed=None):
         if seed is not None:
@@ -110,6 +121,7 @@ class DrivingEnv(gym.Env):
         return [self._seed]
 
     def _generate_map(self):
+        start_time = time.time()
         map_mode = 'random'  # 'random' or 'perlin'
         corridor_width = 3
         min_dist = 50
@@ -137,15 +149,15 @@ class DrivingEnv(gym.Env):
             M = cv2.GaussianBlur(M, (0, 0), sigmaX=10, sigmaY=10)
 
             T = 0.0
-            COST_MAX = 0.2
             drivable = (M <= T)
-            M[M > COST_MAX] = COST_MAX
-            # save M to tiff file
-            cv2.imwrite(os.path.join(self.render_dir, 'M_map.tiff'), M)
             self.cost_map = np.zeros_like(M)
-            mask = ~drivable
-            self.cost_map[mask] = (M[mask] - T) / (COST_MAX - T)
-            cv2.imwrite(os.path.join(self.render_dir, 'cost_map.tiff'), M)
+            # Drivable area: 0, Non-drivable: 1.0 (sharp boundary)
+            self.cost_map[drivable] = 0.0
+            self.cost_map[~drivable] = 1.0
+            # save M to tiff file for debugging
+            cv2.imwrite(os.path.join(self.render_dir, 'M_map.tiff'), M)
+            cv2.imwrite(os.path.join(self.render_dir, 'cost_map.tiff'),
+                        self.cost_map)
 
         drivable = self.cost_map == 0
 
@@ -214,6 +226,8 @@ class DrivingEnv(gym.Env):
         # Assign start and target
         self.start = np.array([sx, sy], dtype=np.int32)
         self.target = np.array([tx, ty], dtype=np.int32)
+        elapsed = time.time() - start_time
+        print(f"[DrivingEnv] Map generated in {elapsed:.3f} seconds.")
 
     def visualize_map(self, filename='map.png'):
         """
@@ -253,25 +267,34 @@ class DrivingEnv(gym.Env):
         cv2.imwrite(path, vis)
 
     def reset(self, *, seed=None, options=None):
+        episode_start_time = time.time()
         self.episode_count += 1
         if seed is not None:
             self.seed(seed)
-        mask = (self.cost_map == 0)
-        ys, xs = np.where(mask)
-        idx = np.random.randint(len(xs))
-        self.pos = np.array([xs[idx], ys[idx]], dtype=np.float32)
-        self.vel = np.zeros(2, dtype=np.float32)
-        # Initialize video writer for this episode
+        # Regenerate the map for each episode
+        self._generate_map()
+        # Dump global map visualization for this episode
         if self.render_dir:
+            self.visualize_map(filename=f"map_ep{self.episode_count:03d}.png")
+        # Set agent to the designated start position from map generation
+        self.pos = self.start.astype(np.float32)
+        self.vel = np.zeros(2, dtype=np.float32)
+        # Only generate video for every 10th episode
+        if self.render_dir and (self.episode_count % 5 == 0
+                                or self.episode_count == 1):
             video_path = os.path.join(self.render_dir,
                                       f'episode_{self.episode_count:03d}.mp4')
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             self.video_writer = cv2.VideoWriter(
                 video_path,
                 fourcc,
-                self.video_fps, (self.view_size, self.view_size),
-                isColor=False)
+                self.video_fps,
+                (self.canvas_size * self.num_levels, self.canvas_size),
+                isColor=True)
+        else:
+            self.video_writer = None
         obs = self._get_obs()
+        self._episode_start_time = episode_start_time  # Save for timing in step
         return obs, {}
 
     def step(self, action):
@@ -297,47 +320,154 @@ class DrivingEnv(gym.Env):
         dist_to_goal = np.linalg.norm(self.pos - self.target)
         terminated = dist_to_goal < self.disk_radius * 2
         r_goal = self.R_goal if terminated else 0.0
+        # Progress reward: positive if moving closer to goal
+        max_dist = np.linalg.norm([self.map_w, self.map_h])
+        if not hasattr(self, '_prev_dist_to_goal'):
+            self._prev_dist_to_goal = dist_to_goal
+        progress = self._prev_dist_to_goal - dist_to_goal
+        r_progress = self.w_dist * (progress / max_dist)
+        self._prev_dist_to_goal = dist_to_goal
+        # Acceleration penalty (normalized)
+        a_norm = np.linalg.norm(action)
+        r_accel = -self.w_accel * (a_norm / self.a_max)
 
         obs = self._get_obs()
-        reward = r_step + r_col + r_goal
+        reward = r_step + r_col + r_goal + r_progress + r_accel
+
+        # Print reward details for debugging every 100 steps
+        if hasattr(self, '_step_count'):
+            self._step_count += 1
+        else:
+            self._step_count = 1
+        if self._step_count % 100 == 0:
+            print(
+                f"[Step {self._step_count}] cost: {cost:.2f}, r_step: {r_step:.2f}, r_col: {r_col:.2f}, r_goal: {r_goal:.2f}, r_progress: {r_progress:.2f}, r_accel: {r_accel:.2f}, total_reward: {reward:.2f}"
+            )
 
         # Render this step: write to video writer
         if self.render_dir and self.video_writer is not None:
-            frame = (obs[0] * 255).astype(np.uint8)
+            frame = self.get_human_frame(action=action,
+                                         canvas_size=self.canvas_size)
             self.video_writer.write(frame)
             if terminated:
                 self.video_writer.release()
                 self.video_writer = None
-
         return obs, reward, terminated, False, {}
 
     def _get_obs(self):
-        # crop view
-        x, y = self.pos
-        half = self.view_size // 2
-        x0 = int(x) - half
-        x1 = x0 + self.view_size
-        y0 = int(y) - half
-        y1 = y0 + self.view_size
-        # pad
-        pad_x0, pad_y0 = max(0, -x0), max(0, -y0)
-        pad_x1, pad_y1 = max(0, x1 - self.map_w), max(0, y1 - self.map_h)
-        x0c, x1c = max(0, x0), min(self.map_w, x1)
-        y0c, y1c = max(0, y0), min(self.map_h, y1)
-        view = np.zeros((self.view_size, self.view_size), dtype=np.float32)
-        view[pad_y0:self.view_size-pad_y1, pad_x0:self.view_size-pad_x1] = \
-            self.cost_map[y0c:y1c, x0c:x1c]
-        # velocity map
-        vel_map = np.full_like(view, np.linalg.norm(self.vel) / self.v_max)
-        # target map
-        target_map = np.zeros_like(view)
-        tx, ty = self.target
-        if x0 <= tx < x1 and y0 <= ty < y1:
-            tx_rel = int(tx - x0)
-            ty_rel = int(ty - y0)
-            cv2.circle(target_map, (tx_rel, ty_rel), int(self.disk_radius),
-                       1.0, -1)
-        return np.stack([view, vel_map, target_map], axis=0)
+        # Pyramid levels: (scale, view_size)
+        pyramid_scales = [1, 4, 16]  # 1: high-res, 4: mid, 16: low-res
+        levels = []
+        for scale in pyramid_scales:
+            size = self.view_size
+            # Compute crop size in map pixels
+            crop_size = size * scale
+            x, y = self.pos
+            half = crop_size // 2
+            x0 = int(x) - half
+            x1 = x0 + crop_size
+            y0 = int(y) - half
+            y1 = y0 + crop_size
+            # pad
+            pad_x0, pad_y0 = max(0, -x0), max(0, -y0)
+            pad_x1, pad_y1 = max(0, x1 - self.map_w), max(0, y1 - self.map_h)
+            x0c, x1c = max(0, x0), min(self.map_w, x1)
+            y0c, y1c = max(0, y0), min(self.map_h, y1)
+            view = np.zeros((crop_size, crop_size), dtype=np.float32)
+            view[pad_y0:crop_size-pad_y1, pad_x0:crop_size-pad_x1] = \
+                self.cost_map[y0c:y1c, x0c:x1c]
+            # Set drivable area (cost==0) to -1.0 for visual distinction
+            view[view == 0.0] = -1.0
+            # Downsample to view_size
+            if scale > 1:
+                view = cv2.resize(view, (self.view_size, self.view_size),
+                                  interpolation=cv2.INTER_AREA)
+
+            # velocity map (now two channels: vx and vy, normalized)
+            vx = np.full_like(view, self.vel[0] / self.v_max)
+            vy = np.full_like(view, self.vel[1] / self.v_max)
+            # target map
+            target_map = np.zeros_like(view)
+            tx, ty = self.target
+            # Compute target position in this crop
+            if x0 <= tx < x1 and y0 <= ty < y1:
+                tx_rel = int((tx - x0) / scale)
+                ty_rel = int((ty - y0) / scale)
+                if 0 <= tx_rel < self.view_size and 0 <= ty_rel < self.view_size:
+                    cv2.circle(target_map, (tx_rel, ty_rel),
+                               max(1, int(self.disk_radius / scale)), 1.0, -1)
+            # Stack: cost, vx, vy, target
+            levels.append(np.stack([view, vx, vy, target_map], axis=0))
+        # Stack pyramid: shape (num_levels, 4, view_size, view_size)
+        return np.stack(levels, axis=0)
+
+    def obs_level_to_image(self, obs_level, canvas_size=256):
+        """
+        Convert a single observation level (4, H, W) to a visualization image.
+        - Cost channel: map to grayscale (min=-1, max=1)
+        - Target: overlay in red (strong), and also as a magenta heatmap
+        """
+        cost = obs_level[0]
+        target_map = obs_level[3]  # channel 3 is target
+        # Normalize cost: -1 (drivable) -> 0 (black), 1 (non-drivable) -> 255 (white)
+        cost_norm = (cost + 1) / 2  # -1..1 -> 0..1
+        img = np.stack([cost_norm, cost_norm, cost_norm], axis=-1)  # (H, W, 3)
+        img = (img * 255).astype(np.uint8)
+        # Overlay target as magenta heatmap (blend with cost image)
+        magenta = np.zeros_like(img)
+        magenta[..., 0] = 255  # Red
+        magenta[..., 2] = 255  # Blue
+        alpha = np.clip(target_map, 0, 1)[..., None]  # (H, W, 1)
+        img = img * (1 - alpha) + magenta * alpha
+        img = img.astype(np.uint8)
+        # Overlay target (where target_map > 0.5) in strong red
+        target_mask = target_map > 0.5
+        img[target_mask] = [0, 0, 255]
+        # Upscale
+        img = cv2.resize(img, (canvas_size, canvas_size), interpolation=cv2.INTER_NEAREST)
+        return img
+
+    def get_human_frame(self, action=None, canvas_size=256):
+        """
+        Generate a high-res visualization for human viewing.
+        - Uses the current observation as the base image for each level
+        - Draws velocity and action vectors as overlays
+        """
+        obs = self._get_obs()  # shape: (num_levels, 3, H, W)
+        vis_levels = []
+        for i in range(self.num_levels):
+            img = self.obs_level_to_image(obs[i], canvas_size=canvas_size)
+            # Draw agent (center)
+            cx, cy = canvas_size // 2, canvas_size // 2
+            cv2.circle(
+                img, (cx, cy),
+                max(3, int(self.disk_radius * (canvas_size / self.view_size))),
+                (0, 255, 0), 2)
+            # Draw velocity vector
+            v_norm = np.linalg.norm(self.vel)
+            if v_norm > 1e-3:
+                v_dir = self.vel / (v_norm + 1e-6)
+                v_len = int((v_norm / self.v_max) * (canvas_size // 4))
+                tip = (int(cx + v_dir[0] * v_len), int(cy + v_dir[1] * v_len))
+                cv2.arrowedLine(img, (cx, cy),
+                                tip, (255, 255, 0),
+                                2,
+                                tipLength=0.3)
+            # Draw action vector if provided
+            if action is not None:
+                a_norm = np.linalg.norm(action)
+                if a_norm > 1e-3:
+                    a_dir = action / (a_norm + 1e-6)
+                    a_len = int((a_norm / self.a_max) * (canvas_size // 4))
+                    tip = (int(cx + a_dir[0] * a_len),
+                           int(cy + a_dir[1] * a_len))
+                    cv2.arrowedLine(img, (cx, cy),
+                                    tip, (0, 128, 255),
+                                    2,
+                                    tipLength=0.3)
+            vis_levels.append(img)
+        frame = np.concatenate(vis_levels, axis=1)
+        return frame
 
 
 ##########################
@@ -366,34 +496,44 @@ class ReplayBuffer:
 ##########################
 class ConvEncoder(nn.Module):
 
-    def __init__(self, view_size):
+    def __init__(self, view_size, num_levels=3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.ReLU(),
-        )
-        self.fc_in = 128 * (view_size // 8) * (view_size // 8)
+        self.num_levels = num_levels
+        # Now input channels = 4 (cost, vx, vy, target)
+        self.encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(4, 32, 3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, 3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(64, 128, 3, stride=2, padding=1),
+                nn.ReLU(),
+            ) for _ in range(num_levels)
+        ])
+        self.fc_in = 128 * (view_size // 8) * (view_size // 8) * num_levels
 
     def forward(self, x):
-        x = self.net(x)
-        return x.view(x.size(0), -1)
+        # x: (B, num_levels, 4, H, W)
+        feats = []
+        for i in range(self.num_levels):
+            xi = x[:, i]  # (B, 4, H, W)
+            fi = self.encoders[i](xi)
+            feats.append(fi.view(fi.size(0), -1))
+        out = torch.cat(feats, dim=1)
+        return out
 
 
 class Actor(nn.Module):
 
-    def __init__(self, view_size, action_dim=2):
+    def __init__(self, view_size, action_dim=2, num_levels=3):
         super().__init__()
-        self.encoder = ConvEncoder(view_size)
+        self.encoder = ConvEncoder(view_size, num_levels)
         self.net = nn.Sequential(nn.Linear(self.encoder.fc_in, 256), nn.ReLU(),
                                  nn.Linear(256, action_dim))
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
     def forward(self, obs):
-        # obs shape: (B,3,H,W)
+        # obs shape: (B, num_levels, 3, H, W)
         h = self.encoder(obs)
         mu = self.net(h)
         std = self.log_std.exp().expand_as(mu)
@@ -403,9 +543,9 @@ class Actor(nn.Module):
 
 class Critic(nn.Module):
 
-    def __init__(self, view_size, action_dim=2):
+    def __init__(self, view_size, action_dim=2, num_levels=3):
         super().__init__()
-        self.encoder = ConvEncoder(view_size)
+        self.encoder = ConvEncoder(view_size, num_levels)
         self.net = nn.Sequential(
             nn.Linear(self.encoder.fc_in + action_dim, 256), nn.ReLU(),
             nn.Linear(256, 1))
@@ -425,36 +565,62 @@ def soft_update(net, target_net, tau):
         tp.data.add_(tau * p.data)
 
 
-def train():
-    render_dir = 'viz'
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = DrivingEnv(render_dir=render_dir)
-    replay = ReplayBuffer(100000)
+def train(cfg: DictConfig):
+    # Set up run directory and TensorBoard
+    run_name = cfg.run_name or f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+    output_dir = to_absolute_path(cfg.output_dir)
+    run_dir = os.path.join(output_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=run_dir)
 
-    actor = Actor(env.view_size).to(device)
-    critic1 = Critic(env.view_size).to(device)
-    critic2 = Critic(env.view_size).to(device)
-    target_critic1 = Critic(env.view_size).to(device)
-    target_critic2 = Critic(env.view_size).to(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env = DrivingEnv(
+        render_dir=run_dir if cfg.env.save_viz else None,
+        view_size=cfg.env.view_size,
+        dt=cfg.env.dt,
+        a_max=cfg.env.a_max,
+        v_max=cfg.env.v_max,
+        w_cost=cfg.env.w_cost,
+        w_col=cfg.env.w_col,
+        R_goal=cfg.env.R_goal,
+        num_agents=cfg.env.num_agents,
+        disk_radius=cfg.env.disk_radius,
+        video_fps=cfg.env.video_fps,
+        w_dist=cfg.env.w_dist,
+        w_accel=cfg.env.w_accel,
+    )
+    replay = ReplayBuffer(cfg.train.replay_size)
+
+    num_levels = env.num_levels
+    actor = Actor(env.view_size, num_levels=num_levels).to(device)
+    critic1 = Critic(env.view_size, num_levels=num_levels).to(device)
+    critic2 = Critic(env.view_size, num_levels=num_levels).to(device)
+    target_critic1 = Critic(env.view_size, num_levels=num_levels).to(device)
+    target_critic2 = Critic(env.view_size, num_levels=num_levels).to(device)
     target_critic1.load_state_dict(critic1.state_dict())
     target_critic2.load_state_dict(critic2.state_dict())
 
-    opt_actor = optim.Adam(actor.parameters(), lr=3e-4)
-    opt_critic1 = optim.Adam(critic1.parameters(), lr=3e-4)
-    opt_critic2 = optim.Adam(critic2.parameters(), lr=3e-4)
+    opt_actor = optim.Adam(actor.parameters(), lr=cfg.train.lr)
+    opt_critic1 = optim.Adam(critic1.parameters(), lr=cfg.train.lr)
+    opt_critic2 = optim.Adam(critic2.parameters(), lr=cfg.train.lr)
 
-    gamma = 0.99
-    tau = 0.005
-    alpha = 0.2
-    batch_size = 64
-    warmup = 1000
+    gamma = cfg.train.gamma
+    tau = cfg.train.tau
+    alpha = cfg.train.alpha
+    batch_size = cfg.train.batch_size
+    warmup = cfg.train.warmup
 
     total_steps = 0
-    for ep in range(1, 501):
+    for ep in range(1, cfg.train.episodes + 1):
+        ep_start_time = time.time()
         obs, _ = env.reset()
         obs = torch.tensor(obs[None], dtype=torch.float32, device=device)
         ep_reward = 0
-        for t in range(1, 1001):
+        ep_loss_q1 = 0
+        ep_loss_q2 = 0
+        ep_loss_pi = 0
+        updates = 0
+        for t in range(1, cfg.train.max_steps + 1):
             total_steps += 1
             # sample action
             with torch.no_grad():
@@ -463,20 +629,16 @@ def train():
             next_obs, r, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             replay.push(obs.cpu().numpy()[0], action, r, next_obs, done)
-            obs = torch.tensor(next_obs[None],
-                               dtype=torch.float32,
-                               device=device)
+            obs = torch.tensor(next_obs[None], dtype=torch.float32, device=device)
             ep_reward += r
 
             if len(replay) > warmup:
                 s, a, rew, s2, d = replay.sample(batch_size)
                 s = torch.tensor(s, dtype=torch.float32, device=device)
                 a = torch.tensor(a, dtype=torch.float32, device=device)
-                rew = torch.tensor(rew, dtype=torch.float32,
-                                   device=device).unsqueeze(1)
+                rew = torch.tensor(rew, dtype=torch.float32, device=device).unsqueeze(1)
                 s2 = torch.tensor(s2, dtype=torch.float32, device=device)
-                d = torch.tensor(d, dtype=torch.float32,
-                                 device=device).unsqueeze(1)
+                d = torch.tensor(d, dtype=torch.float32, device=device).unsqueeze(1)
 
                 with torch.no_grad():
                     dist_next = actor(s2)
@@ -513,15 +675,33 @@ def train():
                 soft_update(critic1, target_critic1, tau)
                 soft_update(critic2, target_critic2, tau)
 
+                ep_loss_q1 += loss_q1.item()
+                ep_loss_q2 += loss_q2.item()
+                ep_loss_pi += loss_pi.item()
+                updates += 1
+
             if done:
                 break
+        ep_time = time.time() - ep_start_time
+        avg_loss_q1 = ep_loss_q1 / updates if updates > 0 else 0
+        avg_loss_q2 = ep_loss_q2 / updates if updates > 0 else 0
+        avg_loss_pi = ep_loss_pi / updates if updates > 0 else 0
+        print(f"Episode {ep} Reward: {ep_reward:.2f} | Time: {ep_time:.3f} seconds | LossQ1: {avg_loss_q1:.4f} | LossQ2: {avg_loss_q2:.4f} | LossPi: {avg_loss_pi:.4f}")
+        writer.add_scalar('Reward/Episode', ep_reward, ep)
+        writer.add_scalar('Loss/Q1', avg_loss_q1, ep)
+        writer.add_scalar('Loss/Q2', avg_loss_q2, ep)
+        writer.add_scalar('Loss/Policy', avg_loss_pi, ep)
+        writer.add_scalar('Time/Episode', ep_time, ep)
+        # save every N eps
+        if ep % cfg.train.save_every == 0:
+            torch.save(actor.state_dict(), os.path.join(run_dir, f"actor_ep{ep}.pth"))
+            torch.save(critic1.state_dict(), os.path.join(run_dir, f"critic1_ep{ep}.pth"))
+    writer.close()
 
-        print(f"Episode {ep} Reward: {ep_reward:.2f}")
-        # save every 50 eps
-        if ep % 50 == 0:
-            torch.save(actor.state_dict(), f"actor_ep{ep}.pth")
-            torch.save(critic1.state_dict(), f"critic1_ep{ep}.pth")
-
+@hydra.main(version_base=None, config_path=None, config_name=None)
+def main(cfg: DictConfig):
+    print("Config:\n", OmegaConf.to_yaml(cfg))
+    train(cfg)
 
 if __name__ == '__main__':
-    train()
+    main()

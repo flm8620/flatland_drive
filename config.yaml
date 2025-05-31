@@ -1,0 +1,41 @@
+# @package _global_
+
+# Hydra config for flat.py RL experiment
+
+# Environment
+env:
+  view_size: 64
+  dt: 0.1
+  a_max: 2.0
+  v_max: 5.0
+  w_cost: 1.0
+  w_col: 1.0
+  R_goal: 50.0
+  num_agents: 1
+  disk_radius: 2.0
+  render_dir: ${hydra:run.dir}/viz
+  video_fps: 30
+  w_dist: 1.0
+  w_accel: 0.1
+
+# Replay buffer
+replay_capacity: 100000
+
+# SAC
+gamma: 0.99
+tau: 0.005
+alpha: 0.2
+batch_size: 128
+warmup: 1000
+
+# Training
+num_episodes: 500
+max_steps_per_episode: 1000
+save_every: 50
+
+# Logging
+log_dir: ${hydra:run.dir}/tb
+run_name: ${now:%Y-%m-%d_%H-%M-%S}_${hydra:job.name}
+
+# Seed
+seed: 42
