@@ -49,13 +49,17 @@ from torch.utils.tensorboard import SummaryWriter
 # RoPE Implementation
 ##########################
 class RotaryEmbedding(nn.Module):
+
     def __init__(self, dim):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (10000**(torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, seq_len, device=None):
-        t = torch.arange(seq_len, device=self.inv_freq.device if device is None else device).type_as(self.inv_freq)
+        t = torch.arange(
+            seq_len,
+            device=self.inv_freq.device if device is None else device).type_as(
+                self.inv_freq)
         freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb
@@ -68,15 +72,17 @@ class RotaryEmbedding(nn.Module):
         head_dim = x.shape[-1]
         half_dim = head_dim // 2
         x1 = x[..., :half_dim]
-        x2 = x[..., half_dim:2*half_dim]
-        sin = rope_emb[:, :half_dim].unsqueeze(0).unsqueeze(2)  # (1, N, 1, half_dim)
-        cos = rope_emb[:, half_dim:2*half_dim].unsqueeze(0).unsqueeze(2)  # (1, N, 1, half_dim)
+        x2 = x[..., half_dim:2 * half_dim]
+        sin = rope_emb[:, :half_dim].unsqueeze(0).unsqueeze(
+            2)  # (1, N, 1, half_dim)
+        cos = rope_emb[:, half_dim:2 * half_dim].unsqueeze(0).unsqueeze(
+            2)  # (1, N, 1, half_dim)
         x_rot1 = x1 * cos - x2 * sin
         x_rot2 = x1 * sin + x2 * cos
         x_rot = torch.cat([x_rot1, x_rot2], dim=-1)
         # If head_dim > 2*half_dim, append the rest unchanged
-        if head_dim > 2*half_dim:
-            x_rot = torch.cat([x_rot, x[..., 2*half_dim:]], dim=-1)
+        if head_dim > 2 * half_dim:
+            x_rot = torch.cat([x_rot, x[..., 2 * half_dim:]], dim=-1)
         return x_rot
 
 
@@ -94,20 +100,8 @@ class DrivingEnv(gym.Env):
     # metadata = {'render.modes': ['human']}
     metadata = {'render.modes': []}
 
-    def __init__(self,
-                 view_size=64,
-                 dt=0.1,
-                 a_max=2.0,
-                 v_max=10.0,
-                 w_cost=1.0,
-                 w_col=1.0,
-                 R_goal=500.0,
-                 num_agents=1,
-                 disk_radius=2.0,
-                 render_dir=None,
-                 video_fps=30,
-                 w_dist=10000.0,
-                 w_accel=0.1):
+    def __init__(self, view_size, dt, a_max, v_max, w_cost, w_col, R_goal,
+                 disk_radius, render_dir, video_fps, w_dist, w_accel):
         super().__init__()
         self.map_h, self.map_w = 512, 512
         self.view_size = view_size
@@ -119,7 +113,6 @@ class DrivingEnv(gym.Env):
         self.w_col = w_col
         self.R_goal = R_goal
         self.disk_radius = disk_radius
-        self.num_agents = num_agents
         self.w_accel = w_accel
 
         # Directory to dump frames or video if set
@@ -536,16 +529,14 @@ class ReplayBuffer:
 
 
 class TransformerBlock(nn.Module):
+
     def __init__(self, dim, heads=4, mlp_ratio=4):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * mlp_ratio),
-            nn.GELU(),
-            nn.Linear(dim * mlp_ratio, dim)
-        )
+        self.mlp = nn.Sequential(nn.Linear(dim, dim * mlp_ratio), nn.GELU(),
+                                 nn.Linear(dim * mlp_ratio, dim))
         self.heads = heads
         self.head_dim = dim // heads
         self.rope = RotaryEmbedding(self.head_dim)
@@ -573,6 +564,7 @@ class TransformerBlock(nn.Module):
 
 
 class ViTEncoder(nn.Module):
+
     def __init__(self,
                  view_size,
                  patch_size=8,
@@ -687,7 +679,6 @@ def train(cfg: DictConfig):
         w_cost=cfg.env.w_cost,
         w_col=cfg.env.w_col,
         R_goal=cfg.env.R_goal,
-        num_agents=cfg.env.num_agents,
         disk_radius=cfg.env.disk_radius,
         video_fps=cfg.env.video_fps,
         w_dist=cfg.env.w_dist,

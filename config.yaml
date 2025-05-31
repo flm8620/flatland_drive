@@ -11,7 +11,6 @@ env:
   w_cost: 1.0
   w_col: 1.0
   R_goal: 50.0
-  num_agents: 1
   disk_radius: 2.0
   render_dir: ${hydra:run.dir}/viz
   video_fps: 30
