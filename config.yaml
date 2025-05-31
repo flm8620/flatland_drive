@@ -17,25 +17,26 @@ env:
   video_fps: 30
   w_dist: 1.0
   w_accel: 0.1
-
-# Replay buffer
-replay_capacity: 100000
-
-# SAC
-gamma: 0.99
-tau: 0.005
-alpha: 0.2
-batch_size: 128
-warmup: 1000
+  save_viz: true
 
 # Training
-num_episodes: 500
-max_steps_per_episode: 1000
-save_every: 50
+train:
+  replay_size: 100000
+  gamma: 0.99
+  tau: 0.005
+  alpha: 0.2
+  batch_size: 32
+  warmup: 1000
+  episodes: 500
+  max_steps: 1000
+  save_every: 50
+  lr: 0.0003
 
 # Logging
 log_dir: ${hydra:run.dir}/tb
-run_name: ${now:%Y-%m-%d_%H-%M-%S}_${hydra:job.name}
+run_name: ${now:%Y-%m-%d_%H-%M-%S}
 
 # Seed
 seed: 42
+
+output_dir: outputs

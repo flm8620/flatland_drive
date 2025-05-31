@@ -26,6 +26,7 @@ The network should only take the current BEV image as input, together with curre
 
 import os
 import numpy as np
+import math
 import cv2
 import gymnasium as gym
 from gymnasium import spaces
@@ -42,6 +43,41 @@ from omegaconf import DictConfig, OmegaConf
 import hydra
 from hydra.utils import to_absolute_path
 from torch.utils.tensorboard import SummaryWriter
+
+
+##########################
+# RoPE Implementation
+##########################
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, seq_len, device=None):
+        t = torch.arange(seq_len, device=self.inv_freq.device if device is None else device).type_as(self.inv_freq)
+        freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb
+
+    @staticmethod
+    def apply_rotary(x, rope_emb):
+        # x: (B, N, num_heads, head_dim)
+        # rope_emb: (N, head_dim)
+        # Only apply to the first 2*half_dim (even, odd pairs)
+        head_dim = x.shape[-1]
+        half_dim = head_dim // 2
+        x1 = x[..., :half_dim]
+        x2 = x[..., half_dim:2*half_dim]
+        sin = rope_emb[:, :half_dim].unsqueeze(0).unsqueeze(2)  # (1, N, 1, half_dim)
+        cos = rope_emb[:, half_dim:2*half_dim].unsqueeze(0).unsqueeze(2)  # (1, N, 1, half_dim)
+        x_rot1 = x1 * cos - x2 * sin
+        x_rot2 = x1 * sin + x2 * cos
+        x_rot = torch.cat([x_rot1, x_rot2], dim=-1)
+        # If head_dim > 2*half_dim, append the rest unchanged
+        if head_dim > 2*half_dim:
+            x_rot = torch.cat([x_rot, x[..., 2*half_dim:]], dim=-1)
+        return x_rot
 
 
 ##########################
@@ -62,15 +98,15 @@ class DrivingEnv(gym.Env):
                  view_size=64,
                  dt=0.1,
                  a_max=2.0,
-                 v_max=5.0,
+                 v_max=10.0,
                  w_cost=1.0,
                  w_col=1.0,
-                 R_goal=50.0,
+                 R_goal=500.0,
                  num_agents=1,
                  disk_radius=2.0,
                  render_dir=None,
                  video_fps=30,
-                 w_dist=1.0,
+                 w_dist=10000.0,
                  w_accel=0.1):
         super().__init__()
         self.map_h, self.map_w = 512, 512
@@ -244,14 +280,7 @@ class DrivingEnv(gym.Env):
         drivable = (self.cost_map == 0)
         # white for drivable
         vis[drivable] = [255, 255, 255]
-        # color cost
-        idx = np.where(~drivable)
-        costs = np.clip(self.cost_map[idx], 0, 1)
-        # BGR: blue->red
-        vis[idx] = np.stack([(255 * (1 - costs)).astype(np.uint8),
-                             np.zeros_like(costs, dtype=np.uint8),
-                             (255 * costs).astype(np.uint8)],
-                            axis=1)
+        vis[~drivable] = [0, 0, 0]
         # draw points
         cv2.circle(vis,
                    tuple(self.start),
@@ -280,8 +309,7 @@ class DrivingEnv(gym.Env):
         self.pos = self.start.astype(np.float32)
         self.vel = np.zeros(2, dtype=np.float32)
         # Only generate video for every 10th episode
-        if self.render_dir and (self.episode_count % 5 == 0
-                                or self.episode_count == 1):
+        if self.render_dir:
             video_path = os.path.join(self.render_dir,
                                       f'episode_{self.episode_count:03d}.mp4')
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -298,10 +326,17 @@ class DrivingEnv(gym.Env):
         return obs, {}
 
     def step(self, action):
-        # clip
-        a = np.clip(action, -self.a_max, self.a_max)
-        # dynamics
-        self.vel = np.clip(self.vel + a * self.dt, -self.v_max, self.v_max)
+        # Limit acceleration by norm (ball projection)
+        a = np.array(action)
+        a_norm = np.linalg.norm(a)
+        if a_norm > self.a_max:
+            a = a * (self.a_max / a_norm)
+        # Update velocity
+        self.vel = self.vel + a * self.dt
+        # Limit velocity by norm (ball projection)
+        v_norm = np.linalg.norm(self.vel)
+        if v_norm > self.v_max:
+            self.vel = self.vel * (self.v_max / v_norm)
         self.pos = self.pos + self.vel * self.dt
 
         # boundary warp
@@ -329,7 +364,8 @@ class DrivingEnv(gym.Env):
         self._prev_dist_to_goal = dist_to_goal
         # Acceleration penalty (normalized)
         a_norm = np.linalg.norm(action)
-        r_accel = -self.w_accel * (a_norm / self.a_max)
+        excess = max(0, a_norm - self.a_max)
+        r_accel = -self.w_accel * (excess / self.a_max)
 
         obs = self._get_obs()
         reward = r_step + r_col + r_goal + r_progress + r_accel
@@ -395,7 +431,9 @@ class DrivingEnv(gym.Env):
                 ty_rel = int((ty - y0) / scale)
                 if 0 <= tx_rel < self.view_size and 0 <= ty_rel < self.view_size:
                     cv2.circle(target_map, (tx_rel, ty_rel),
-                               max(1, int(self.disk_radius / scale)), 1.0, -1)
+                               color=1.0,
+                               radius=2,
+                               thickness=-1)
             # Stack: cost, vx, vy, target
             levels.append(np.stack([view, vx, vy, target_map], axis=0))
         # Stack pyramid: shape (num_levels, 4, view_size, view_size)
@@ -424,7 +462,8 @@ class DrivingEnv(gym.Env):
         target_mask = target_map > 0.5
         img[target_mask] = [0, 0, 255]
         # Upscale
-        img = cv2.resize(img, (canvas_size, canvas_size), interpolation=cv2.INTER_NEAREST)
+        img = cv2.resize(img, (canvas_size, canvas_size),
+                         interpolation=cv2.INTER_NEAREST)
         return img
 
     def get_human_frame(self, action=None, canvas_size=256):
@@ -494,32 +533,91 @@ class ReplayBuffer:
 ##########################
 # 3. Networks
 ##########################
-class ConvEncoder(nn.Module):
 
-    def __init__(self, view_size, num_levels=3):
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, heads=4, mlp_ratio=4):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim)
+        )
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.rope = RotaryEmbedding(self.head_dim)
+
+    def forward(self, x):
+        # x: (B, N, D)
+        B, N, D = x.shape
+        x_norm = self.norm1(x)
+        # Prepare Q, K, V for MultiheadAttention
+        q = k = v = x_norm
+        # Reshape for RoPE: (B, N, heads, head_dim)
+        q = q.view(B, N, self.heads, self.head_dim)
+        k = k.view(B, N, self.heads, self.head_dim)
+        rope_emb = self.rope(N, device=x.device)  # (N, head_dim)
+        q = RotaryEmbedding.apply_rotary(q, rope_emb)
+        k = RotaryEmbedding.apply_rotary(k, rope_emb)
+        # Merge heads back: (B, N, D)
+        q = q.reshape(B, N, D)
+        k = k.reshape(B, N, D)
+        # MultiheadAttention expects (B, N, D)
+        attn_out, _ = self.attn(q, k, v)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class ViTEncoder(nn.Module):
+    def __init__(self,
+                 view_size,
+                 patch_size=8,
+                 in_chans=4,
+                 embed_dim=128,
+                 depth=6,
+                 num_levels=3):
         super().__init__()
         self.num_levels = num_levels
-        # Now input channels = 4 (cost, vx, vy, target)
-        self.encoders = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(4, 32, 3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(32, 64, 3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(64, 128, 3, stride=2, padding=1),
-                nn.ReLU(),
-            ) for _ in range(num_levels)
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.patch_proj = nn.ModuleList([
+            nn.Linear(in_chans * patch_size * patch_size, embed_dim)
+            for _ in range(num_levels)
         ])
-        self.fc_in = 128 * (view_size // 8) * (view_size // 8) * num_levels
+        self.transformer = nn.ModuleList([
+            nn.Sequential(*[
+                TransformerBlock(embed_dim, heads=8, mlp_ratio=8)
+                for _ in range(depth)
+            ]) for _ in range(num_levels)
+        ])
+        self.fc_out = nn.Linear(embed_dim * num_levels, embed_dim * num_levels)
+        self.view_size = view_size
 
     def forward(self, x):
         # x: (B, num_levels, 4, H, W)
         feats = []
         for i in range(self.num_levels):
             xi = x[:, i]  # (B, 4, H, W)
-            fi = self.encoders[i](xi)
-            feats.append(fi.view(fi.size(0), -1))
-        out = torch.cat(feats, dim=1)
+            B, C, H, W = xi.shape
+            # Patchify
+            patches = xi.unfold(2, self.patch_size, self.patch_size).unfold(
+                3, self.patch_size, self.patch_size)
+            patches = patches.permute(0, 2, 3, 1, 4,
+                                      5).contiguous()  # (B, nH, nW, C, pH, pW)
+            patches = patches.view(B, -1, C * self.patch_size *
+                                   self.patch_size)  # (B, N, patch_dim)
+            # Linear proj
+            tokens = self.patch_proj[i](patches)  # (B, N, D)
+            tokens = self.transformer[i](tokens)
+            # Pool (mean)
+            pooled = tokens.mean(dim=1)
+            feats.append(pooled)
+        out = torch.cat(feats, dim=-1)
+        out = self.fc_out(out)
         return out
 
 
@@ -527,10 +625,14 @@ class Actor(nn.Module):
 
     def __init__(self, view_size, action_dim=2, num_levels=3):
         super().__init__()
-        self.encoder = ConvEncoder(view_size, num_levels)
-        self.net = nn.Sequential(nn.Linear(self.encoder.fc_in, 256), nn.ReLU(),
-                                 nn.Linear(256, action_dim))
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.encoder = ViTEncoder(view_size,
+                                  num_levels=num_levels,
+                                  embed_dim=128)
+        self.net = nn.Sequential(
+            nn.Linear(self.encoder.embed_dim * num_levels, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, action_dim))
+        self.log_std = nn.Parameter(torch.full(
+            (action_dim, ), -1.0))  # Lower initial std for smoother actions
 
     def forward(self, obs):
         # obs shape: (B, num_levels, 3, H, W)
@@ -545,10 +647,12 @@ class Critic(nn.Module):
 
     def __init__(self, view_size, action_dim=2, num_levels=3):
         super().__init__()
-        self.encoder = ConvEncoder(view_size, num_levels)
+        self.encoder = ViTEncoder(view_size,
+                                  num_levels=num_levels,
+                                  embed_dim=128)
         self.net = nn.Sequential(
-            nn.Linear(self.encoder.fc_in + action_dim, 256), nn.ReLU(),
-            nn.Linear(256, 1))
+            nn.Linear(self.encoder.embed_dim * num_levels + action_dim, 128),
+            nn.ReLU(), nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, 1))
 
     def forward(self, obs, action):
         h = self.encoder(obs)
@@ -629,16 +733,20 @@ def train(cfg: DictConfig):
             next_obs, r, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             replay.push(obs.cpu().numpy()[0], action, r, next_obs, done)
-            obs = torch.tensor(next_obs[None], dtype=torch.float32, device=device)
+            obs = torch.tensor(next_obs[None],
+                               dtype=torch.float32,
+                               device=device)
             ep_reward += r
 
             if len(replay) > warmup:
                 s, a, rew, s2, d = replay.sample(batch_size)
                 s = torch.tensor(s, dtype=torch.float32, device=device)
                 a = torch.tensor(a, dtype=torch.float32, device=device)
-                rew = torch.tensor(rew, dtype=torch.float32, device=device).unsqueeze(1)
+                rew = torch.tensor(rew, dtype=torch.float32,
+                                   device=device).unsqueeze(1)
                 s2 = torch.tensor(s2, dtype=torch.float32, device=device)
-                d = torch.tensor(d, dtype=torch.float32, device=device).unsqueeze(1)
+                d = torch.tensor(d, dtype=torch.float32,
+                                 device=device).unsqueeze(1)
 
                 with torch.no_grad():
                     dist_next = actor(s2)
@@ -686,7 +794,9 @@ def train(cfg: DictConfig):
         avg_loss_q1 = ep_loss_q1 / updates if updates > 0 else 0
         avg_loss_q2 = ep_loss_q2 / updates if updates > 0 else 0
         avg_loss_pi = ep_loss_pi / updates if updates > 0 else 0
-        print(f"Episode {ep} Reward: {ep_reward:.2f} | Time: {ep_time:.3f} seconds | LossQ1: {avg_loss_q1:.4f} | LossQ2: {avg_loss_q2:.4f} | LossPi: {avg_loss_pi:.4f}")
+        print(
+            f"Episode {ep} Reward: {ep_reward:.2f} | Time: {ep_time:.3f} seconds | LossQ1: {avg_loss_q1:.4f} | LossQ2: {avg_loss_q2:.4f} | LossPi: {avg_loss_pi:.4f}"
+        )
         writer.add_scalar('Reward/Episode', ep_reward, ep)
         writer.add_scalar('Loss/Q1', avg_loss_q1, ep)
         writer.add_scalar('Loss/Q2', avg_loss_q2, ep)
@@ -694,14 +804,18 @@ def train(cfg: DictConfig):
         writer.add_scalar('Time/Episode', ep_time, ep)
         # save every N eps
         if ep % cfg.train.save_every == 0:
-            torch.save(actor.state_dict(), os.path.join(run_dir, f"actor_ep{ep}.pth"))
-            torch.save(critic1.state_dict(), os.path.join(run_dir, f"critic1_ep{ep}.pth"))
+            torch.save(actor.state_dict(),
+                       os.path.join(run_dir, f"actor_ep{ep}.pth"))
+            torch.save(critic1.state_dict(),
+                       os.path.join(run_dir, f"critic1_ep{ep}.pth"))
     writer.close()
 
-@hydra.main(version_base=None, config_path=None, config_name=None)
+
+@hydra.main(version_base=None, config_path=".", config_name="config")
 def main(cfg: DictConfig):
     print("Config:\n", OmegaConf.to_yaml(cfg))
     train(cfg)
+
 
 if __name__ == '__main__':
     main()
