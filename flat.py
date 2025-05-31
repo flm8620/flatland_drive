@@ -101,7 +101,8 @@ class DrivingEnv(gym.Env):
     metadata = {'render.modes': []}
 
     def __init__(self, view_size, dt, a_max, v_max, w_cost, w_col, R_goal,
-                 disk_radius, render_dir, video_fps, w_dist, w_accel):
+                 disk_radius, render_dir, video_fps, w_dist, w_accel,
+                 max_steps):
         super().__init__()
         self.map_h, self.map_w = 512, 512
         self.view_size = view_size
@@ -142,6 +143,8 @@ class DrivingEnv(gym.Env):
         self.seed()
 
         self.canvas_size = 256  # For human video rendering
+        self.max_steps = max_steps
+        self._step_count = 0
 
     def seed(self, seed=None):
         if seed is not None:
@@ -316,6 +319,7 @@ class DrivingEnv(gym.Env):
             self.video_writer = None
         obs = self._get_obs()
         self._episode_start_time = episode_start_time  # Save for timing in step
+        self._step_count = 0  # Reset step counter
         return obs, {}
 
     def step(self, action):
@@ -381,7 +385,9 @@ class DrivingEnv(gym.Env):
             if terminated:
                 self.video_writer.release()
                 self.video_writer = None
-        return obs, reward, terminated, False, {}
+        # Determine if truncated (time/step limit reached)
+        truncated = self._step_count >= self.max_steps
+        return obs, reward, terminated, truncated, {}
 
     def _get_obs(self):
         # Pyramid levels: (scale, view_size)
@@ -627,7 +633,7 @@ class Actor(nn.Module):
             (action_dim, ), -1.0))  # Lower initial std for smoother actions
 
     def forward(self, obs):
-        # obs shape: (B, num_levels, 3, H, W)
+        # obs shape: (B, num_levels, 4, H, W)
         h = self.encoder(obs)
         mu = self.net(h)
         std = self.log_std.exp().expand_as(mu)
@@ -670,20 +676,19 @@ def train(cfg: DictConfig):
     writer = SummaryWriter(log_dir=run_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = DrivingEnv(
-        render_dir=run_dir if cfg.env.save_viz else None,
-        view_size=cfg.env.view_size,
-        dt=cfg.env.dt,
-        a_max=cfg.env.a_max,
-        v_max=cfg.env.v_max,
-        w_cost=cfg.env.w_cost,
-        w_col=cfg.env.w_col,
-        R_goal=cfg.env.R_goal,
-        disk_radius=cfg.env.disk_radius,
-        video_fps=cfg.env.video_fps,
-        w_dist=cfg.env.w_dist,
-        w_accel=cfg.env.w_accel,
-    )
+    env = DrivingEnv(render_dir=run_dir if cfg.env.save_viz else None,
+                     view_size=cfg.env.view_size,
+                     dt=cfg.env.dt,
+                     a_max=cfg.env.a_max,
+                     v_max=cfg.env.v_max,
+                     w_cost=cfg.env.w_cost,
+                     w_col=cfg.env.w_col,
+                     R_goal=cfg.env.R_goal,
+                     disk_radius=cfg.env.disk_radius,
+                     video_fps=cfg.env.video_fps,
+                     w_dist=cfg.env.w_dist,
+                     w_accel=cfg.env.w_accel,
+                     max_steps=cfg.train.max_steps)
     replay = ReplayBuffer(cfg.train.replay_size)
 
     num_levels = env.num_levels
@@ -715,7 +720,8 @@ def train(cfg: DictConfig):
         ep_loss_q2 = 0
         ep_loss_pi = 0
         updates = 0
-        for t in range(1, cfg.train.max_steps + 1):
+        done = False
+        while not done:
             total_steps += 1
             # sample action
             with torch.no_grad():
@@ -779,8 +785,6 @@ def train(cfg: DictConfig):
                 ep_loss_pi += loss_pi.item()
                 updates += 1
 
-            if done:
-                break
         ep_time = time.time() - ep_start_time
         avg_loss_q1 = ep_loss_q1 / updates if updates > 0 else 0
         avg_loss_q2 = ep_loss_q2 / updates if updates > 0 else 0
