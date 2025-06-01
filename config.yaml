@@ -27,7 +27,7 @@ train:
   batch_size: 32
   warmup: 1000
   episodes: 500
-  max_steps: 1000
+  max_steps: 2000
   save_every: 50
   lr: 0.0003
 
@@ -39,3 +39,9 @@ run_name: ${now:%Y-%m-%d_%H-%M-%S}
 seed: 42
 
 output_dir: outputs
+
+# Model selection
+model:
+  type: conv   # Options: 'vit' or 'conv'
+  vit_embed_dim: 128
+  conv_out_dim: 384

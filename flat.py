@@ -44,46 +44,7 @@ import hydra
 from hydra.utils import to_absolute_path
 from torch.utils.tensorboard import SummaryWriter
 
-
-##########################
-# RoPE Implementation
-##########################
-class RotaryEmbedding(nn.Module):
-
-    def __init__(self, dim):
-        super().__init__()
-        inv_freq = 1.0 / (10000**(torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, seq_len, device=None):
-        t = torch.arange(
-            seq_len,
-            device=self.inv_freq.device if device is None else device).type_as(
-                self.inv_freq)
-        freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb
-
-    @staticmethod
-    def apply_rotary(x, rope_emb):
-        # x: (B, N, num_heads, head_dim)
-        # rope_emb: (N, head_dim)
-        # Only apply to the first 2*half_dim (even, odd pairs)
-        head_dim = x.shape[-1]
-        half_dim = head_dim // 2
-        x1 = x[..., :half_dim]
-        x2 = x[..., half_dim:2 * half_dim]
-        sin = rope_emb[:, :half_dim].unsqueeze(0).unsqueeze(
-            2)  # (1, N, 1, half_dim)
-        cos = rope_emb[:, half_dim:2 * half_dim].unsqueeze(0).unsqueeze(
-            2)  # (1, N, 1, half_dim)
-        x_rot1 = x1 * cos - x2 * sin
-        x_rot2 = x1 * sin + x2 * cos
-        x_rot = torch.cat([x_rot1, x_rot2], dim=-1)
-        # If head_dim > 2*half_dim, append the rest unchanged
-        if head_dim > 2 * half_dim:
-            x_rot = torch.cat([x_rot, x[..., 2 * half_dim:]], dim=-1)
-        return x_rot
+from networks import ViTEncoder, ConvEncoder
 
 
 ##########################
@@ -154,42 +115,30 @@ class DrivingEnv(gym.Env):
 
     def _generate_map(self):
         start_time = time.time()
-        map_mode = 'random'  # 'random' or 'perlin'
         corridor_width = 3
         min_dist = 50
 
-        if map_mode == 'perlin':
-            perlin_scale = 50.0
-            simplex = OpenSimplex(seed=self._seed)
-            xs = np.arange(self.map_w)
-            ys = np.arange(self.map_h)
-            grid_x, grid_y = np.meshgrid(xs, ys)
-            M = np.vectorize(lambda i, j: simplex.noise2d(
-                i / perlin_scale, j / perlin_scale))(grid_y, grid_x)
-            M = M.astype(np.float32)
-        else:
-            rng = np.random.RandomState(self._seed)
-            M = rng.rand(self.map_h, self.map_w).astype(np.float32)
-            # set border to strong positive value as world border
-            BORDER_VALUE = 1.5
-            M[0, :] = BORDER_VALUE
-            M[-1, :] = BORDER_VALUE
-            M[:, 0] = BORDER_VALUE
-            M[:, -1] = BORDER_VALUE
-            M -= 0.5
-            M *= 10
-            M = cv2.GaussianBlur(M, (0, 0), sigmaX=10, sigmaY=10)
+        M = np.random.rand(self.map_h, self.map_w).astype(np.float32)
+        # set border to strong positive value as world border
+        BORDER_VALUE = 1.5
+        M[0, :] = BORDER_VALUE
+        M[-1, :] = BORDER_VALUE
+        M[:, 0] = BORDER_VALUE
+        M[:, -1] = BORDER_VALUE
+        M -= 0.5
+        M *= 10
+        M = cv2.GaussianBlur(M, (0, 0), sigmaX=10, sigmaY=10)
 
-            T = 0.0
-            drivable = (M <= T)
-            self.cost_map = np.zeros_like(M)
-            # Drivable area: 0, Non-drivable: 1.0 (sharp boundary)
-            self.cost_map[drivable] = 0.0
-            self.cost_map[~drivable] = 1.0
-            # save M to tiff file for debugging
-            cv2.imwrite(os.path.join(self.render_dir, 'M_map.tiff'), M)
-            cv2.imwrite(os.path.join(self.render_dir, 'cost_map.tiff'),
-                        self.cost_map)
+        T = 0.0
+        drivable = (M <= T)
+        self.cost_map = np.zeros_like(M)
+        # Drivable area: 0, Non-drivable: 1.0 (sharp boundary)
+        self.cost_map[drivable] = 0.0
+        self.cost_map[~drivable] = 1.0
+        # save M to tiff file for debugging
+        # cv2.imwrite(os.path.join(self.render_dir, 'M_map.tiff'), M)
+        # cv2.imwrite(os.path.join(self.render_dir, 'cost_map.tiff'),
+        #             self.cost_map)
 
         drivable = self.cost_map == 0
 
@@ -534,106 +483,29 @@ class ReplayBuffer:
 ##########################
 
 
-class TransformerBlock(nn.Module):
-
-    def __init__(self, dim, heads=4, mlp_ratio=4):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(nn.Linear(dim, dim * mlp_ratio), nn.GELU(),
-                                 nn.Linear(dim * mlp_ratio, dim))
-        self.heads = heads
-        self.head_dim = dim // heads
-        self.rope = RotaryEmbedding(self.head_dim)
-
-    def forward(self, x):
-        # x: (B, N, D)
-        B, N, D = x.shape
-        x_norm = self.norm1(x)
-        # Prepare Q, K, V for MultiheadAttention
-        q = k = v = x_norm
-        # Reshape for RoPE: (B, N, heads, head_dim)
-        q = q.view(B, N, self.heads, self.head_dim)
-        k = k.view(B, N, self.heads, self.head_dim)
-        rope_emb = self.rope(N, device=x.device)  # (N, head_dim)
-        q = RotaryEmbedding.apply_rotary(q, rope_emb)
-        k = RotaryEmbedding.apply_rotary(k, rope_emb)
-        # Merge heads back: (B, N, D)
-        q = q.reshape(B, N, D)
-        k = k.reshape(B, N, D)
-        # MultiheadAttention expects (B, N, D)
-        attn_out, _ = self.attn(q, k, v)
-        x = x + attn_out
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class ViTEncoder(nn.Module):
-
-    def __init__(self,
-                 view_size,
-                 patch_size=8,
-                 in_chans=4,
-                 embed_dim=128,
-                 depth=6,
-                 num_levels=3):
-        super().__init__()
-        self.num_levels = num_levels
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-        self.patch_proj = nn.ModuleList([
-            nn.Linear(in_chans * patch_size * patch_size, embed_dim)
-            for _ in range(num_levels)
-        ])
-        self.transformer = nn.ModuleList([
-            nn.Sequential(*[
-                TransformerBlock(embed_dim, heads=8, mlp_ratio=8)
-                for _ in range(depth)
-            ]) for _ in range(num_levels)
-        ])
-        self.fc_out = nn.Linear(embed_dim * num_levels, embed_dim * num_levels)
-        self.view_size = view_size
-
-    def forward(self, x):
-        # x: (B, num_levels, 4, H, W)
-        feats = []
-        for i in range(self.num_levels):
-            xi = x[:, i]  # (B, 4, H, W)
-            B, C, H, W = xi.shape
-            # Patchify
-            patches = xi.unfold(2, self.patch_size, self.patch_size).unfold(
-                3, self.patch_size, self.patch_size)
-            patches = patches.permute(0, 2, 3, 1, 4,
-                                      5).contiguous()  # (B, nH, nW, C, pH, pW)
-            patches = patches.view(B, -1, C * self.patch_size *
-                                   self.patch_size)  # (B, N, patch_dim)
-            # Linear proj
-            tokens = self.patch_proj[i](patches)  # (B, N, D)
-            tokens = self.transformer[i](tokens)
-            # Pool (mean)
-            pooled = tokens.mean(dim=1)
-            feats.append(pooled)
-        out = torch.cat(feats, dim=-1)
-        out = self.fc_out(out)
-        return out
+# --- Model selection ---
+def make_encoder(cfg, view_size, num_levels):
+    if cfg.model.type == 'vit':
+        return ViTEncoder(view_size, num_levels=num_levels, embed_dim=cfg.model.vit_embed_dim)
+    elif cfg.model.type == 'conv':
+        return ConvEncoder(view_size, num_levels=num_levels, out_dim=cfg.model.conv_out_dim)
+    else:
+        raise ValueError(f"Unknown model type: {cfg.model.type}")
 
 
 class Actor(nn.Module):
-
-    def __init__(self, view_size, action_dim=2, num_levels=3):
+    def __init__(self, cfg, view_size, action_dim=2, num_levels=3):
         super().__init__()
-        self.encoder = ViTEncoder(view_size,
-                                  num_levels=num_levels,
-                                  embed_dim=128)
+        self.encoder = make_encoder(cfg, view_size, num_levels)
         self.net = nn.Sequential(
-            nn.Linear(self.encoder.embed_dim * num_levels, 128), nn.ReLU(),
-            nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, action_dim))
-        self.log_std = nn.Parameter(torch.full(
-            (action_dim, ), -1.0))  # Lower initial std for smoother actions
+            nn.Linear(self.encoder.fc_out.out_features if hasattr(self.encoder, 'fc_out') else self.encoder.out_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim))
+        self.log_std = nn.Parameter(torch.full((action_dim,), -2.0))
 
     def forward(self, obs):
-        # obs shape: (B, num_levels, 4, H, W)
         h = self.encoder(obs)
         mu = self.net(h)
         std = self.log_std.exp().expand_as(mu)
@@ -642,15 +514,15 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-
-    def __init__(self, view_size, action_dim=2, num_levels=3):
+    def __init__(self, cfg, view_size, action_dim=2, num_levels=3):
         super().__init__()
-        self.encoder = ViTEncoder(view_size,
-                                  num_levels=num_levels,
-                                  embed_dim=128)
+        self.encoder = make_encoder(cfg, view_size, num_levels)
         self.net = nn.Sequential(
-            nn.Linear(self.encoder.embed_dim * num_levels + action_dim, 128),
-            nn.ReLU(), nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, 1))
+            nn.Linear((self.encoder.fc_out.out_features if hasattr(self.encoder, 'fc_out') else self.encoder.out_dim) + action_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1))
 
     def forward(self, obs, action):
         h = self.encoder(obs)
@@ -692,11 +564,11 @@ def train(cfg: DictConfig):
     replay = ReplayBuffer(cfg.train.replay_size)
 
     num_levels = env.num_levels
-    actor = Actor(env.view_size, num_levels=num_levels).to(device)
-    critic1 = Critic(env.view_size, num_levels=num_levels).to(device)
-    critic2 = Critic(env.view_size, num_levels=num_levels).to(device)
-    target_critic1 = Critic(env.view_size, num_levels=num_levels).to(device)
-    target_critic2 = Critic(env.view_size, num_levels=num_levels).to(device)
+    actor = Actor(cfg, env.view_size, num_levels=num_levels).to(device)
+    critic1 = Critic(cfg, env.view_size, num_levels=num_levels).to(device)
+    critic2 = Critic(cfg, env.view_size, num_levels=num_levels).to(device)
+    target_critic1 = Critic(cfg, env.view_size, num_levels=num_levels).to(device)
+    target_critic2 = Critic(cfg, env.view_size, num_levels=num_levels).to(device)
     target_critic1.load_state_dict(critic1.state_dict())
     target_critic2.load_state_dict(critic2.state_dict())
 
