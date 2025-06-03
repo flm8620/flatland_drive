@@ -43,6 +43,7 @@ from omegaconf import DictConfig, OmegaConf
 import hydra
 from hydra.utils import to_absolute_path
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm  # Add tqdm import
 
 from networks import ViTEncoder, ConvEncoder
 
@@ -61,48 +62,38 @@ class DrivingEnv(gym.Env):
     # metadata = {'render.modes': ['human']}
     metadata = {'render.modes': []}
 
-    def __init__(self, view_size, dt, a_max, v_max, w_cost, w_col, R_goal,
-                 disk_radius, render_dir, video_fps, w_dist, w_accel,
-                 max_steps):
+    def __init__(self, view_size, dt, a_max, v_max, w_col, R_goal, disk_radius,
+                 render_dir, video_fps, w_dist, w_accel, max_steps,
+                 hitwall_cost, pyramid_scales, num_levels):
         super().__init__()
         self.map_h, self.map_w = 512, 512
         self.view_size = view_size
         self.dt = dt
         self.a_max = a_max
         self.v_max = v_max
-        self.w_cost = w_cost
         self.w_dist = w_dist
         self.w_col = w_col
         self.R_goal = R_goal
         self.disk_radius = disk_radius
         self.w_accel = w_accel
-
-        # Directory to dump frames or video if set
+        self.hitwall_cost = hitwall_cost
         self.render_dir = render_dir
         self.video_fps = video_fps
-        self.episode_count = 0
         self.video_writer = None
         if self.render_dir:
             os.makedirs(self.render_dir, exist_ok=True)
-
-        # Action: 2-d acceleration
         self.action_space = spaces.Box(low=-a_max,
                                        high=a_max,
                                        shape=(2, ),
                                        dtype=np.float32)
-
-        # Obs: image + velocity
-        self.pyramid_scales = [1, 4, 16]
-        self.num_levels = len(self.pyramid_scales)
+        self.pyramid_scales = list(pyramid_scales)
+        self.num_levels = num_levels
         self.observation_space = spaces.Box(low=0.0,
                                             high=1.0,
                                             shape=(self.num_levels, 3,
                                                    view_size, view_size),
                                             dtype=np.float32)
-        # we'll concatenate flattened vel channels at right-most pixels
-
         self.seed()
-
         self.canvas_size = 256  # For human video rendering
         self.max_steps = max_steps
         self._step_count = 0
@@ -240,23 +231,32 @@ class DrivingEnv(gym.Env):
         path = os.path.join(self.render_dir, filename)
         cv2.imwrite(path, vis)
 
-    def reset(self, *, seed=None, options=None):
+    def reset(self,
+              *,
+              seed=None,
+              options=None,
+              render_video=None,
+              episode_num=None):
         episode_start_time = time.time()
-        self.episode_count += 1
         if seed is not None:
             self.seed(seed)
         # Regenerate the map for each episode
         self._generate_map()
+        # Use episode_num for debug file naming
+        self._current_episode_num = episode_num if episode_num is not None else 1
         # Dump global map visualization for this episode
         if self.render_dir:
-            self.visualize_map(filename=f"map_ep{self.episode_count:03d}.png")
+            self.visualize_map(
+                filename=f"map_ep{self._current_episode_num:03d}.png")
         # Set agent to the designated start position from map generation
         self.pos = self.start.astype(np.float32)
         self.vel = np.zeros(2, dtype=np.float32)
-        # Only generate video for every 10th episode
-        if self.render_dir:
-            video_path = os.path.join(self.render_dir,
-                                      f'episode_{self.episode_count:03d}.mp4')
+
+        # Use render_video argument to decide video_writer
+        if render_video:
+            video_path = os.path.join(
+                self.render_dir,
+                f'episode_{self._current_episode_num:03d}.mp4')
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             self.video_writer = cv2.VideoWriter(
                 video_path,
@@ -292,7 +292,23 @@ class DrivingEnv(gym.Env):
         # costs
         x_i, y_i = int(self.pos[0]), int(self.pos[1])
         cost = self.cost_map[y_i, x_i]
-        r_step = -self.w_cost * cost
+        # r_step removed since wall collision now terminates with -100
+
+        # Wall collision: terminate and give high negative reward
+        hit_wall = cost > 0
+        if hit_wall:
+            reward = self.hitwall_cost
+            terminated = True
+            obs = self._get_obs()
+            # Render this step: write to video writer
+            if self.render_dir and self.video_writer is not None:
+                frame = self.get_human_frame(action=action,
+                                             canvas_size=self.canvas_size)
+                self.video_writer.write(frame)
+                self.video_writer.release()
+                self.video_writer = None
+            truncated = self._step_count >= self.max_steps
+            return obs, reward, terminated, truncated, {}
 
         # collision (single agent skip)
         r_col = 0.0
@@ -314,7 +330,7 @@ class DrivingEnv(gym.Env):
         r_accel = -self.w_accel * (excess / self.a_max)
 
         obs = self._get_obs()
-        reward = r_step + r_col + r_goal + r_progress + r_accel
+        reward = r_col + r_goal + r_progress + r_accel
 
         # Print reward details for debugging every 100 steps
         if hasattr(self, '_step_count'):
@@ -323,7 +339,7 @@ class DrivingEnv(gym.Env):
             self._step_count = 1
         if self._step_count % 100 == 0:
             print(
-                f"[Step {self._step_count}] cost: {cost:.2f}, r_step: {r_step:.2f}, r_col: {r_col:.2f}, r_goal: {r_goal:.2f}, r_progress: {r_progress:.2f}, r_accel: {r_accel:.2f}, total_reward: {reward:.2f}"
+                f"[Step {self._step_count}] cost: {cost:.2f}, r_col: {r_col:.2f}, r_goal: {r_goal:.2f}, r_progress: {r_progress:.2f}, r_accel: {r_accel:.2f}, total_reward: {reward:.2f}"
             )
 
         # Render this step: write to video writer
@@ -340,7 +356,7 @@ class DrivingEnv(gym.Env):
 
     def _get_obs(self):
         # Pyramid levels: (scale, view_size)
-        pyramid_scales = [1, 4, 16]  # 1: high-res, 4: mid, 16: low-res
+        pyramid_scales = self.pyramid_scales  # Use instance variable from config
         levels = []
         for scale in pyramid_scales:
             size = self.view_size
@@ -486,24 +502,29 @@ class ReplayBuffer:
 # --- Model selection ---
 def make_encoder(cfg, view_size, num_levels):
     if cfg.model.type == 'vit':
-        return ViTEncoder(view_size, num_levels=num_levels, embed_dim=cfg.model.vit_embed_dim)
+        return ViTEncoder(view_size,
+                          num_levels=num_levels,
+                          embed_dim=cfg.model.vit_embed_dim)
     elif cfg.model.type == 'conv':
-        return ConvEncoder(view_size, num_levels=num_levels, out_dim=cfg.model.conv_out_dim)
+        return ConvEncoder(view_size,
+                           num_levels=num_levels,
+                           out_dim=cfg.model.conv_out_dim)
     else:
         raise ValueError(f"Unknown model type: {cfg.model.type}")
 
 
 class Actor(nn.Module):
+
     def __init__(self, cfg, view_size, action_dim=2, num_levels=3):
         super().__init__()
         self.encoder = make_encoder(cfg, view_size, num_levels)
         self.net = nn.Sequential(
-            nn.Linear(self.encoder.fc_out.out_features if hasattr(self.encoder, 'fc_out') else self.encoder.out_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
+            nn.Linear(
+                self.encoder.fc_out.out_features if hasattr(
+                    self.encoder, 'fc_out') else self.encoder.out_dim, 128),
+            nn.ReLU(), nn.Linear(128, 128), nn.ReLU(),
             nn.Linear(128, action_dim))
-        self.log_std = nn.Parameter(torch.full((action_dim,), -2.0))
+        self.log_std = nn.Parameter(torch.full((action_dim, ), -2.0))
 
     def forward(self, obs):
         h = self.encoder(obs)
@@ -514,15 +535,15 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
+
     def __init__(self, cfg, view_size, action_dim=2, num_levels=3):
         super().__init__()
         self.encoder = make_encoder(cfg, view_size, num_levels)
         self.net = nn.Sequential(
-            nn.Linear((self.encoder.fc_out.out_features if hasattr(self.encoder, 'fc_out') else self.encoder.out_dim) + action_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1))
+            nn.Linear((self.encoder.fc_out.out_features if hasattr(
+                self.encoder, 'fc_out') else self.encoder.out_dim) +
+                      action_dim, 128), nn.ReLU(), nn.Linear(128, 128),
+            nn.ReLU(), nn.Linear(128, 1))
 
     def forward(self, obs, action):
         h = self.encoder(obs)
@@ -547,28 +568,17 @@ def train(cfg: DictConfig):
     os.makedirs(run_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_dir)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = DrivingEnv(render_dir=run_dir if cfg.env.save_viz else None,
-                     view_size=cfg.env.view_size,
-                     dt=cfg.env.dt,
-                     a_max=cfg.env.a_max,
-                     v_max=cfg.env.v_max,
-                     w_cost=cfg.env.w_cost,
-                     w_col=cfg.env.w_col,
-                     R_goal=cfg.env.R_goal,
-                     disk_radius=cfg.env.disk_radius,
-                     video_fps=cfg.env.video_fps,
-                     w_dist=cfg.env.w_dist,
-                     w_accel=cfg.env.w_accel,
-                     max_steps=cfg.train.max_steps)
+    device = torch.device("cuda")
     replay = ReplayBuffer(cfg.train.replay_size)
 
-    num_levels = env.num_levels
-    actor = Actor(cfg, env.view_size, num_levels=num_levels).to(device)
-    critic1 = Critic(cfg, env.view_size, num_levels=num_levels).to(device)
-    critic2 = Critic(cfg, env.view_size, num_levels=num_levels).to(device)
-    target_critic1 = Critic(cfg, env.view_size, num_levels=num_levels).to(device)
-    target_critic2 = Critic(cfg, env.view_size, num_levels=num_levels).to(device)
+    num_levels = cfg.env.num_levels
+    actor = Actor(cfg, cfg.env.view_size, num_levels=num_levels).to(device)
+    critic1 = Critic(cfg, cfg.env.view_size, num_levels=num_levels).to(device)
+    critic2 = Critic(cfg, cfg.env.view_size, num_levels=num_levels).to(device)
+    target_critic1 = Critic(cfg, cfg.env.view_size,
+                            num_levels=num_levels).to(device)
+    target_critic2 = Critic(cfg, cfg.env.view_size,
+                            num_levels=num_levels).to(device)
     target_critic1.load_state_dict(critic1.state_dict())
     target_critic2.load_state_dict(critic2.state_dict())
 
@@ -582,10 +592,71 @@ def train(cfg: DictConfig):
     batch_size = cfg.train.batch_size
     warmup = cfg.train.warmup
 
+    use_amp = getattr(cfg.train, 'use_amp',
+                      True)  # Default to True for backward compatibility
+
+    # Dummy GradScaler for non-AMP mode
+    class DummyScaler:
+
+        def scale(self, loss):
+            return loss
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            pass
+
+    scaler = torch.amp.GradScaler(device=device) if use_amp else DummyScaler()
+
+    def backward_and_step(loss, optimizer):
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+
     total_steps = 0
-    for ep in range(1, cfg.train.episodes + 1):
+
+    # --- Load latest checkpoint if exists ---
+    latest_ep = 0
+    import re
+    actor_ckpts = [
+        f for f in os.listdir(run_dir) if re.match(r"actor_ep(\\d+)\\.pth", f)
+    ]
+    if actor_ckpts:
+        # Find the highest episode number
+        ep_nums = [
+            int(re.findall(r"actor_ep(\\d+)\\.pth", f)[0]) for f in actor_ckpts
+        ]
+        latest_ep = max(ep_nums)
+        actor_path = os.path.join(run_dir, f"actor_ep{latest_ep}.pth")
+        critic1_path = os.path.join(run_dir, f"critic1_ep{latest_ep}.pth")
+        if os.path.exists(actor_path):
+            print(f"[INFO] Loading actor weights from {actor_path}")
+            actor.load_state_dict(torch.load(actor_path))
+        if os.path.exists(critic1_path):
+            print(f"[INFO] Loading critic1 weights from {critic1_path}")
+            critic1.load_state_dict(torch.load(critic1_path))
+
+    # Use autocast context inline, and wrap scaler logic in a helper for elegance
+    for ep in range(latest_ep + 1, cfg.train.episodes + 1):
         ep_start_time = time.time()
-        obs, _ = env.reset()
+        # Create a new environment for each episode to avoid state carryover
+        env = DrivingEnv(render_dir=run_dir if cfg.env.save_viz else None,
+                         view_size=cfg.env.view_size,
+                         dt=cfg.env.dt,
+                         a_max=cfg.env.a_max,
+                         v_max=cfg.env.v_max,
+                         w_col=cfg.env.w_col,
+                         R_goal=cfg.env.R_goal,
+                         disk_radius=cfg.env.disk_radius,
+                         video_fps=cfg.env.video_fps,
+                         w_dist=cfg.env.w_dist,
+                         w_accel=cfg.env.w_accel,
+                         max_steps=cfg.train.max_steps,
+                         hitwall_cost=cfg.env.hitwall_cost,
+                         pyramid_scales=cfg.env.pyramid_scales,
+                         num_levels=cfg.env.num_levels)
+        render_video = cfg.env.save_viz and (ep % cfg.env.render_every == 0)
+        obs, _ = env.reset(render_video=render_video, episode_num=ep)
         obs = torch.tensor(obs[None], dtype=torch.float32, device=device)
         ep_reward = 0
         ep_loss_q1 = 0
@@ -593,69 +664,74 @@ def train(cfg: DictConfig):
         ep_loss_pi = 0
         updates = 0
         done = False
-        while not done:
-            total_steps += 1
-            # sample action
-            with torch.no_grad():
-                dist = actor(obs)
-                action = dist.sample().cpu().numpy()[0]
-            next_obs, r, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            replay.push(obs.cpu().numpy()[0], action, r, next_obs, done)
-            obs = torch.tensor(next_obs[None],
-                               dtype=torch.float32,
-                               device=device)
-            ep_reward += r
-
-            if len(replay) > warmup:
-                s, a, rew, s2, d = replay.sample(batch_size)
-                s = torch.tensor(s, dtype=torch.float32, device=device)
-                a = torch.tensor(a, dtype=torch.float32, device=device)
-                rew = torch.tensor(rew, dtype=torch.float32,
-                                   device=device).unsqueeze(1)
-                s2 = torch.tensor(s2, dtype=torch.float32, device=device)
-                d = torch.tensor(d, dtype=torch.float32,
-                                 device=device).unsqueeze(1)
-
+        step_count = 0
+        with tqdm(total=cfg.train.max_steps, desc=f"Episode {ep}",
+                  leave=False) as pbar:
+            while not done:
+                total_steps += 1
                 with torch.no_grad():
-                    dist_next = actor(s2)
-                    a2 = dist_next.rsample()
-                    logp2 = dist_next.log_prob(a2).sum(-1, keepdim=True)
-                    q1_target = target_critic1(s2, a2)
-                    q2_target = target_critic2(s2, a2)
-                    q_target = torch.min(q1_target, q2_target) - alpha * logp2
-                    y = rew + (1 - d) * gamma * q_target
+                    dist = actor(obs)
+                    action = dist.sample().cpu().numpy()[0]
+                next_obs, r, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                replay.push(obs.cpu().numpy()[0], action, r, next_obs, done)
+                obs = torch.tensor(next_obs[None],
+                                   dtype=torch.float32,
+                                   device=device)
+                ep_reward += r
+                step_count += 1
+                pbar.update(1)
 
-                q1 = critic1(s, a)
-                q2 = critic2(s, a)
-                loss_q1 = F.mse_loss(q1, y)
-                loss_q2 = F.mse_loss(q2, y)
-                opt_critic1.zero_grad()
-                loss_q1.backward()
-                opt_critic1.step()
-                opt_critic2.zero_grad()
-                loss_q2.backward()
-                opt_critic2.step()
+                if len(replay) > warmup:
+                    s, a, rew, s2, d = replay.sample(batch_size)
+                    s = torch.tensor(s, dtype=torch.float32, device=device)
+                    a = torch.tensor(a, dtype=torch.float32, device=device)
+                    rew = torch.tensor(rew, dtype=torch.float32,
+                                       device=device).unsqueeze(1)
+                    s2 = torch.tensor(s2, dtype=torch.float32, device=device)
+                    d = torch.tensor(d, dtype=torch.float32,
+                                     device=device).unsqueeze(1)
 
-                # actor update
-                dist_curr = actor(s)
-                a_curr = dist_curr.rsample()
-                logp = dist_curr.log_prob(a_curr).sum(-1, keepdim=True)
-                q1_pi = critic1(s, a_curr)
-                q2_pi = critic2(s, a_curr)
-                loss_pi = (alpha * logp - torch.min(q1_pi, q2_pi)).mean()
-                opt_actor.zero_grad()
-                loss_pi.backward()
-                opt_actor.step()
-
-                # soft updates
-                soft_update(critic1, target_critic1, tau)
-                soft_update(critic2, target_critic2, tau)
-
-                ep_loss_q1 += loss_q1.item()
-                ep_loss_q2 += loss_q2.item()
-                ep_loss_pi += loss_pi.item()
-                updates += 1
+                    with torch.amp.autocast(device_type='cuda',
+                                            enabled=use_amp):
+                        with torch.no_grad():
+                            dist_next = actor(s2)
+                            a2 = dist_next.rsample()
+                            logp2 = dist_next.log_prob(a2).sum(-1,
+                                                               keepdim=True)
+                            q1_target = target_critic1(s2, a2)
+                            q2_target = target_critic2(s2, a2)
+                            q_target = torch.min(q1_target,
+                                                 q2_target) - alpha * logp2
+                            y = rew + (1 - d) * gamma * q_target
+                        q1 = critic1(s, a)
+                        q2 = critic2(s, a)
+                        loss_q1 = F.mse_loss(q1, y)
+                        loss_q2 = F.mse_loss(q2, y)
+                    opt_critic1.zero_grad()
+                    backward_and_step(loss_q1, opt_critic1)
+                    opt_critic2.zero_grad()
+                    backward_and_step(loss_q2, opt_critic2)
+                    scaler.update()
+                    # actor update
+                    with torch.amp.autocast(device_type='cuda',
+                                            enabled=use_amp):
+                        dist_curr = actor(s)
+                        a_curr = dist_curr.rsample()
+                        logp = dist_curr.log_prob(a_curr).sum(-1, keepdim=True)
+                        q1_pi = critic1(s, a_curr)
+                        q2_pi = critic2(s, a_curr)
+                        loss_pi = (alpha * logp -
+                                   torch.min(q1_pi, q2_pi)).mean()
+                    opt_actor.zero_grad()
+                    backward_and_step(loss_pi, opt_actor)
+                    scaler.update()
+                    soft_update(critic1, target_critic1, tau)
+                    soft_update(critic2, target_critic2, tau)
+                    ep_loss_q1 += loss_q1.item()
+                    ep_loss_q2 += loss_q2.item()
+                    ep_loss_pi += loss_pi.item()
+                    updates += 1
 
         ep_time = time.time() - ep_start_time
         avg_loss_q1 = ep_loss_q1 / updates if updates > 0 else 0

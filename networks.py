@@ -95,29 +95,60 @@ class ViTEncoder(nn.Module):
         return out
 
 # --- Simple ConvNet ---
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = None
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        out = self.relu(out)
+        return out
+
 class ConvEncoder(nn.Module):
     def __init__(self, view_size, in_chans=4, num_levels=3, out_dim=384):
         super().__init__()
         self.num_levels = num_levels
         self.view_size = view_size
         self.out_dim = out_dim
-        self.convs = nn.ModuleList([
+        self.encoders = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(in_chans, 32, 3, stride=2, padding=1), nn.ReLU(),
-                nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
-                nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),
+                nn.Conv2d(in_chans, 32, 3, stride=1, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+                ResidualBlock(32, 64, stride=2),
+                ResidualBlock(64, 128, stride=2),
+                ResidualBlock(128, 256, stride=2),
+                ResidualBlock(256, 256, stride=2),
                 nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Dropout(0.2),
             ) for _ in range(num_levels)
         ])
-        self.fc = nn.Linear(128 * num_levels, out_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(256 * num_levels, 512), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(512, out_dim)
+        )
 
     def forward(self, x):
         feats = []
         for i in range(self.num_levels):
             xi = x[:, i]
-            feat = self.convs[i](xi)
-            feat = feat.view(xi.size(0), -1)
+            feat = self.encoders[i](xi)
             feats.append(feat)
         out = torch.cat(feats, dim=-1)
-        out = self.fc(out)
+        out = self.mlp(out)
         return out
