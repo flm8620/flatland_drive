@@ -44,6 +44,7 @@ import hydra
 from hydra.utils import to_absolute_path
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # Add tqdm import
+import imageio.v2 as imageio
 
 from networks import ViTEncoder, ConvEncoder
 
@@ -64,7 +65,8 @@ class DrivingEnv(gym.Env):
 
     def __init__(self, view_size, dt, a_max, v_max, w_col, R_goal, disk_radius,
                  render_dir, video_fps, w_dist, w_accel, max_steps,
-                 hitwall_cost, pyramid_scales, num_levels):
+                 hitwall_cost, pyramid_scales, num_levels,
+                 min_start_goal_dist=50, max_start_goal_dist=200):
         super().__init__()
         self.map_h, self.map_w = 512, 512
         self.view_size = view_size
@@ -97,6 +99,8 @@ class DrivingEnv(gym.Env):
         self.canvas_size = 256  # For human video rendering
         self.max_steps = max_steps
         self._step_count = 0
+        self.min_start_goal_dist = min_start_goal_dist
+        self.max_start_goal_dist = max_start_goal_dist
 
     def seed(self, seed=None):
         if seed is not None:
@@ -107,99 +111,75 @@ class DrivingEnv(gym.Env):
     def _generate_map(self):
         start_time = time.time()
         corridor_width = 3
-        min_dist = 50
+        min_dist = self.min_start_goal_dist
+        max_dist = self.max_start_goal_dist
 
-        M = np.random.rand(self.map_h, self.map_w).astype(np.float32)
-        # set border to strong positive value as world border
-        BORDER_VALUE = 1.5
-        M[0, :] = BORDER_VALUE
-        M[-1, :] = BORDER_VALUE
-        M[:, 0] = BORDER_VALUE
-        M[:, -1] = BORDER_VALUE
-        M -= 0.5
-        M *= 10
-        M = cv2.GaussianBlur(M, (0, 0), sigmaX=10, sigmaY=10)
+        while True:
+            M = np.random.rand(self.map_h, self.map_w).astype(np.float32)
+            # set border to strong positive value as world border
+            BORDER_VALUE = 1.5
+            M[0, :] = BORDER_VALUE
+            M[-1, :] = BORDER_VALUE
+            M[:, 0] = BORDER_VALUE
+            M[:, -1] = BORDER_VALUE
+            M -= 0.5
+            M *= 10
+            M = cv2.GaussianBlur(M, (0, 0), sigmaX=10, sigmaY=10)
 
-        T = 0.0
-        drivable = (M <= T)
-        self.cost_map = np.zeros_like(M)
-        # Drivable area: 0, Non-drivable: 1.0 (sharp boundary)
-        self.cost_map[drivable] = 0.0
-        self.cost_map[~drivable] = 1.0
-        # save M to tiff file for debugging
-        # cv2.imwrite(os.path.join(self.render_dir, 'M_map.tiff'), M)
-        # cv2.imwrite(os.path.join(self.render_dir, 'cost_map.tiff'),
-        #             self.cost_map)
+            T = 0.0
+            drivable = (M <= T)
+            self.cost_map = np.zeros_like(M)
+            # Drivable area: 0, Non-drivable: 1.0 (sharp boundary)
+            self.cost_map[drivable] = 0.0
+            self.cost_map[~drivable] = 1.0
 
-        drivable = self.cost_map == 0
+            drivable = self.cost_map == 0
 
-        # 3) Enforce minimum width by eroding drivable mask
-        kernel_size = 2 * corridor_width + 1
-        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                       (kernel_size, kernel_size))
-        eroded = cv2.erode(drivable.astype(np.uint8), se).astype(bool)
+            # 3) Enforce minimum width by eroding drivable mask
+            kernel_size = 2 * corridor_width + 1
+            se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (kernel_size, kernel_size))
+            eroded = cv2.erode(drivable.astype(np.uint8), se).astype(bool)
 
-        # 4) Pick a random target on eroded mask
-        ys_e, xs_e = np.where(eroded)
-        if len(xs_e) < 2:
-            raise RuntimeError(
-                "Not enough wide drivable area to place start and target")
+            # 4) Pick a random target on eroded mask
+            ys_e, xs_e = np.where(eroded)
+            if len(xs_e) < 2:
+                continue  # Not enough drivable area, regenerate
 
-        best_pair = None  # will store (tx, ty, sx, sy)
-        best_dist = -1
-        chosen = False
-
-        for _ in range(10):
-            # sample a candidate target
+            # Randomly pick a target
             idx_t = np.random.randint(len(xs_e))
-            tx_c, ty_c = xs_e[idx_t], ys_e[idx_t]
+            tx, ty = xs_e[idx_t], ys_e[idx_t]
 
-            # BFS flood-fill from (ty_c, tx_c) over the eroded mask
+            # BFS flood-fill from (ty, tx) over the eroded mask
             visited = np.zeros_like(eroded, bool)
-            queue = deque([(ty_c, tx_c)])
-            visited[ty_c, tx_c] = True
+            queue = deque([(ty, tx)])
+            visited[ty, tx] = True
+            dists = np.full_like(eroded, -1, dtype=np.float32)
+            dists[ty, tx] = 0
             while queue:
                 y0, x0 = queue.popleft()
                 for dy, dx in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
                     ny, nx = y0 + dy, x0 + dx
                     if 0 <= ny < self.map_h and 0 <= nx < self.map_w \
-                    and eroded[ny, nx] and not visited[ny, nx]:
+                        and eroded[ny, nx] and not visited[ny, nx]:
                         visited[ny, nx] = True
+                        dists[ny, nx] = dists[y0, x0] + 1
                         queue.append((ny, nx))
 
-            pts = np.argwhere(visited)
+            # Collect all positions within [min_dist, max_dist] (in L2 distance)
+            pts = np.argwhere((visited) & (dists >= min_dist) & (dists <= max_dist))
             # drop the target itself
-            pts = pts[~((pts[:, 0] == ty_c) & (pts[:, 1] == tx_c))]
+            pts = pts[~((pts[:, 0] == ty) & (pts[:, 1] == tx))]
             if len(pts) == 0:
-                continue
+                continue  # No valid start, regenerate map
 
-            # measure distances
-            dists = np.linalg.norm(pts - np.array([ty_c, tx_c]), axis=1)
-            idx_max = np.argmax(dists)
-            max_dist = dists[idx_max]
-
-            # if this pair is far enough, take it immediately
-            if max_dist >= min_dist:
-                sy, sx = pts[idx_max]
-                tx, ty = tx_c, ty_c
-                chosen = True
-                break
-
-            # otherwise remember it if it's the best so far
-            if max_dist > best_dist:
-                best_dist = max_dist
-                sy, sx = pts[idx_max]
-                best_pair = (tx_c, ty_c, sx, sy)
-
-        # if none exceeded min_dist, use the best one
-        if not chosen and best_pair is not None:
-            tx, ty, sx, sy = best_pair
-
-        # Assign start and target
-        self.start = np.array([sx, sy], dtype=np.int32)
-        self.target = np.array([tx, ty], dtype=np.int32)
-        elapsed = time.time() - start_time
-        print(f"[DrivingEnv] Map generated in {elapsed:.3f} seconds.")
+            # Randomly select one as start
+            sy, sx = pts[np.random.randint(len(pts))]
+            self.start = np.array([sx, sy], dtype=np.int32)
+            self.target = np.array([tx, ty], dtype=np.int32)
+            elapsed = time.time() - start_time
+            print(f"[DrivingEnv] Map generated in {elapsed:.3f} seconds. Start-goal dist: {dists[sy, sx]:.1f}")
+            break
 
     def visualize_map(self, filename='map.png'):
         """
@@ -257,15 +237,11 @@ class DrivingEnv(gym.Env):
             video_path = os.path.join(
                 self.render_dir,
                 f'episode_{self._current_episode_num:03d}.mp4')
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.video_writer = cv2.VideoWriter(
-                video_path,
-                fourcc,
-                self.video_fps,
-                (self.canvas_size * self.num_levels, self.canvas_size),
-                isColor=True)
+            self._video_path = video_path
+            self._video_frames = []
         else:
-            self.video_writer = None
+            self._video_path = None
+            self._video_frames = None
         obs = self._get_obs()
         self._episode_start_time = episode_start_time  # Save for timing in step
         self._step_count = 0  # Reset step counter
@@ -294,21 +270,31 @@ class DrivingEnv(gym.Env):
         cost = self.cost_map[y_i, x_i]
         # r_step removed since wall collision now terminates with -100
 
+        self._step_count += 1
+        truncated = self._step_count >= self.max_steps
         # Wall collision: terminate and give high negative reward
         hit_wall = cost > 0
         if hit_wall:
             reward = self.hitwall_cost
             terminated = True
             obs = self._get_obs()
-            # Render this step: write to video writer
-            if self.render_dir and self.video_writer is not None:
-                frame = self.get_human_frame(action=action,
-                                             canvas_size=self.canvas_size)
-                self.video_writer.write(frame)
-                self.video_writer.release()
-                self.video_writer = None
-            truncated = self._step_count >= self.max_steps
-            return obs, reward, terminated, truncated, {}
+            info = {
+                'hitwall': reward,
+                'r_accel': 0.0,
+                'r_progress': 0.0,
+                'r_goal': 0.0,
+                'r_col': 0.0
+            }
+            # Render this step: collect frame for imageio
+            if self.render_dir and self._video_frames is not None:
+                frame = self.get_human_frame(action=action, canvas_size=self.canvas_size)
+                # Convert BGR (OpenCV) to RGB for imageio
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                self._video_frames.append(frame_rgb)
+                if terminated or truncated:
+                    imageio.mimsave(self._video_path, self._video_frames, fps=self.video_fps, codec='libx264')
+                    self._video_frames = None
+            return obs, reward, terminated, truncated, info
 
         # collision (single agent skip)
         r_col = 0.0
@@ -332,27 +318,26 @@ class DrivingEnv(gym.Env):
         obs = self._get_obs()
         reward = r_col + r_goal + r_progress + r_accel
 
-        # Print reward details for debugging every 100 steps
-        if hasattr(self, '_step_count'):
-            self._step_count += 1
-        else:
-            self._step_count = 1
-        if self._step_count % 100 == 0:
-            print(
-                f"[Step {self._step_count}] cost: {cost:.2f}, r_col: {r_col:.2f}, r_goal: {r_goal:.2f}, r_progress: {r_progress:.2f}, r_accel: {r_accel:.2f}, total_reward: {reward:.2f}"
-            )
+        info = {
+            'hitwall': 0.0,
+            'r_accel': r_accel,
+            'r_progress': r_progress,
+            'r_goal': r_goal,
+            'r_col': r_col
+        }
 
-        # Render this step: write to video writer
-        if self.render_dir and self.video_writer is not None:
-            frame = self.get_human_frame(action=action,
-                                         canvas_size=self.canvas_size)
-            self.video_writer.write(frame)
-            if terminated:
-                self.video_writer.release()
-                self.video_writer = None
-        # Determine if truncated (time/step limit reached)
-        truncated = self._step_count >= self.max_steps
-        return obs, reward, terminated, truncated, {}
+
+        # Render this step: collect frame for imageio
+        if self.render_dir and self._video_frames is not None:
+            frame = self.get_human_frame(action=action, canvas_size=self.canvas_size)
+            # Convert BGR (OpenCV) to RGB for imageio
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self._video_frames.append(frame_rgb)
+            # Save video if episode ends by termination or truncation
+            if terminated or truncated:
+                imageio.mimsave(self._video_path, self._video_frames, fps=self.video_fps, codec='libx264')
+                self._video_frames = None
+        return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
         # Pyramid levels: (scale, view_size)
@@ -458,6 +443,9 @@ class DrivingEnv(gym.Env):
                                 tipLength=0.3)
             # Draw action vector if provided
             if action is not None:
+                # assert action is not NaN nor Inf
+                if not np.isfinite(action).all():
+                    raise ValueError("Action contains NaN or Inf values.")
                 a_norm = np.linalg.norm(action)
                 if a_norm > 1e-3:
                     a_dir = action / (a_norm + 1e-6)
@@ -654,33 +642,54 @@ def train(cfg: DictConfig):
                          max_steps=cfg.train.max_steps,
                          hitwall_cost=cfg.env.hitwall_cost,
                          pyramid_scales=cfg.env.pyramid_scales,
-                         num_levels=cfg.env.num_levels)
+                         num_levels=cfg.env.num_levels,
+                         min_start_goal_dist=cfg.env.min_start_goal_dist,
+                         max_start_goal_dist=cfg.env.max_start_goal_dist)
         render_video = cfg.env.save_viz and (ep % cfg.env.render_every == 0)
         obs, _ = env.reset(render_video=render_video, episode_num=ep)
         obs = torch.tensor(obs[None], dtype=torch.float32, device=device)
-        ep_reward = 0
+        ep_reward_discounted = 0
         ep_loss_q1 = 0
         ep_loss_q2 = 0
         ep_loss_pi = 0
         updates = 0
         done = False
         step_count = 0
+        # --- Only accumulators for discounted reward components ---
+        total_hitwall = 0.0
+        total_r_accel = 0.0
+        total_r_progress = 0.0
+        total_r_goal = 0.0
+        total_r_col = 0.0
+        gamma_pow = 1.0
         with tqdm(total=cfg.train.max_steps, desc=f"Episode {ep}",
                   leave=False) as pbar:
             while not done:
                 total_steps += 1
                 with torch.no_grad():
                     dist = actor(obs)
+                    # Assert actor output is valid
+                    mu = dist.mean
+                    std = dist.stddev
+                    assert torch.isfinite(mu).all(), "Actor mean contains NaN or Inf"
+                    assert torch.isfinite(std).all(), "Actor stddev contains NaN or Inf"
                     action = dist.sample().cpu().numpy()[0]
-                next_obs, r, terminated, truncated, _ = env.step(action)
+                next_obs, r, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 replay.push(obs.cpu().numpy()[0], action, r, next_obs, done)
                 obs = torch.tensor(next_obs[None],
                                    dtype=torch.float32,
                                    device=device)
-                ep_reward += r
+                ep_reward_discounted += gamma_pow * r
                 step_count += 1
                 pbar.update(1)
+                # --- Use info dict for discounted reward components ---
+                total_r_col += gamma_pow * info.get('r_col', 0.0)
+                total_r_goal += gamma_pow * info.get('r_goal', 0.0)
+                total_r_progress += gamma_pow * info.get('r_progress', 0.0)
+                total_r_accel += gamma_pow * info.get('r_accel', 0.0)
+                total_hitwall += gamma_pow * info.get('hitwall', 0.0)
+                gamma_pow *= gamma
 
                 if len(replay) > warmup:
                     s, a, rew, s2, d = replay.sample(batch_size)
@@ -696,16 +705,27 @@ def train(cfg: DictConfig):
                                             enabled=use_amp):
                         with torch.no_grad():
                             dist_next = actor(s2)
+                            # Assert actor output is valid
+                            mu_next = dist_next.mean
+                            std_next = dist_next.stddev
+                            assert torch.isfinite(mu_next).all(), "Actor mean (next) contains NaN or Inf"
+                            assert torch.isfinite(std_next).all(), "Actor stddev (next) contains NaN or Inf"
                             a2 = dist_next.rsample()
                             logp2 = dist_next.log_prob(a2).sum(-1,
                                                                keepdim=True)
                             q1_target = target_critic1(s2, a2)
                             q2_target = target_critic2(s2, a2)
+                            # Assert critic outputs are valid
+                            assert torch.isfinite(q1_target).all(), "Critic1 target output contains NaN or Inf"
+                            assert torch.isfinite(q2_target).all(), "Critic2 target output contains NaN or Inf"
                             q_target = torch.min(q1_target,
                                                  q2_target) - alpha * logp2
                             y = rew + (1 - d) * gamma * q_target
                         q1 = critic1(s, a)
                         q2 = critic2(s, a)
+                        # Assert critic outputs are valid
+                        assert torch.isfinite(q1).all(), "Critic1 output contains NaN or Inf"
+                        assert torch.isfinite(q2).all(), "Critic2 output contains NaN or Inf"
                         loss_q1 = F.mse_loss(q1, y)
                         loss_q2 = F.mse_loss(q2, y)
                     opt_critic1.zero_grad()
@@ -717,10 +737,18 @@ def train(cfg: DictConfig):
                     with torch.amp.autocast(device_type='cuda',
                                             enabled=use_amp):
                         dist_curr = actor(s)
+                        # Assert actor output is valid
+                        mu_curr = dist_curr.mean
+                        std_curr = dist_curr.stddev
+                        assert torch.isfinite(mu_curr).all(), "Actor mean (curr) contains NaN or Inf"
+                        assert torch.isfinite(std_curr).all(), "Actor stddev (curr) contains NaN or Inf"
                         a_curr = dist_curr.rsample()
                         logp = dist_curr.log_prob(a_curr).sum(-1, keepdim=True)
                         q1_pi = critic1(s, a_curr)
                         q2_pi = critic2(s, a_curr)
+                        # Assert critic outputs are valid
+                        assert torch.isfinite(q1_pi).all(), "Critic1 pi output contains NaN or Inf"
+                        assert torch.isfinite(q2_pi).all(), "Critic2 pi output contains NaN or Inf"
                         loss_pi = (alpha * logp -
                                    torch.min(q1_pi, q2_pi)).mean()
                     opt_actor.zero_grad()
@@ -738,9 +766,10 @@ def train(cfg: DictConfig):
         avg_loss_q2 = ep_loss_q2 / updates if updates > 0 else 0
         avg_loss_pi = ep_loss_pi / updates if updates > 0 else 0
         print(
-            f"Episode {ep} Reward: {ep_reward:.2f} | Time: {ep_time:.3f} seconds | LossQ1: {avg_loss_q1:.4f} | LossQ2: {avg_loss_q2:.4f} | LossPi: {avg_loss_pi:.4f}"
-        )
-        writer.add_scalar('Reward/Episode', ep_reward, ep)
+            f"Episode {ep} Discounted Reward: {ep_reward_discounted:.2f} | Time: {ep_time:.3f} seconds | LossQ1: {avg_loss_q1:.4f} | LossQ2: {avg_loss_q2:.4f} | LossPi: {avg_loss_pi:.4f}")
+        # --- Print only discounted costs for each kind ---
+        print(f"[Episode {ep} Discounted Totals] hitwall: {total_hitwall:.2f}, accel: {total_r_accel:.2f}, progress: {total_r_progress:.2f}, goal: {total_r_goal:.2f}, col: {total_r_col:.2f}")
+        writer.add_scalar('Reward/Episode', ep_reward_discounted, ep)
         writer.add_scalar('Loss/Q1', avg_loss_q1, ep)
         writer.add_scalar('Loss/Q2', avg_loss_q2, ep)
         writer.add_scalar('Loss/Policy', avg_loss_pi, ep)

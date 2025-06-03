@@ -20,6 +20,8 @@ env:
   hitwall_cost: -100.0
   pyramid_scales: [1, 4, 16]
   num_levels: 3
+  min_start_goal_dist: 5   # Minimum allowed distance between start and goal
+  max_start_goal_dist: 30  # Maximum allowed distance between start and goal
 
 # Training
 train:
@@ -32,7 +34,7 @@ train:
   episodes: 500
   max_steps: 2000
   save_every: 50
-  lr: 0.0003
+  lr: 0.003
   use_amp: false
 
 # Logging
