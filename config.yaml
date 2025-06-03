@@ -25,17 +25,16 @@ env:
 
 # Training
 train:
-  replay_size: 10000
+  lr: 0.0003
   gamma: 0.99
-  tau: 0.005
-  alpha: 0.05
-  batch_size: 32
-  warmup: 1000
+  gae_lambda: 0.95
+  rollout_steps: 2048
+  ppo_epochs: 4
+  batch_size: 64
+  clip_eps: 0.2
   episodes: 500
   max_steps: 2000
   save_every: 50
-  lr: 0.003
-  use_amp: false
 
 # Logging
 log_dir: ${hydra:run.dir}/tb

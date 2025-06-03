@@ -530,18 +530,26 @@ class Actor(nn.Module):
     def __init__(self, cfg, view_size, action_dim=2, num_levels=3):
         super().__init__()
         self.encoder = make_encoder(cfg, view_size, num_levels)
+        hidden_dim = self.encoder.fc_out.out_features if hasattr(
+            self.encoder, 'fc_out') else self.encoder.out_dim
         self.net = nn.Sequential(
-            nn.Linear(
-                self.encoder.fc_out.out_features if hasattr(
-                    self.encoder, 'fc_out') else self.encoder.out_dim, 128),
-            nn.ReLU(), nn.Linear(128, 128), nn.ReLU(),
-            nn.Linear(128, action_dim))
-        self.log_std = nn.Parameter(torch.full((action_dim, ), -2.0))
+            nn.Linear(hidden_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+        )
+        self.mu_head = nn.Linear(128, action_dim)
+        self.log_std_head = nn.Linear(128, action_dim)
+        self.LOG_STD_MIN = -20
+        self.LOG_STD_MAX = 2
 
     def forward(self, obs):
         h = self.encoder(obs)
-        mu = self.net(h)
-        std = self.log_std.exp().expand_as(mu)
+        x = self.net(h)
+        mu = self.mu_head(x)
+        log_std = self.log_std_head(x)
+        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        std = log_std.exp()
         dist = torch.distributions.Normal(mu, std)
         return dist
 
@@ -564,16 +572,59 @@ class Critic(nn.Module):
 
 
 ##########################
-# 4. SAC Trainer
+# 4. PPO
 ##########################
-def soft_update(net, target_net, tau):
-    for p, tp in zip(net.parameters(), target_net.parameters()):
-        tp.data.mul_(1 - tau)
-        tp.data.add_(tau * p.data)
+class RolloutBuffer:
+
+    def __init__(self, size, obs_shape, action_dim, device):
+        self.size = size
+        self.device = device
+        self.ptr = 0
+        self.full = False
+        self.obs = torch.zeros((size, *obs_shape),
+                               dtype=torch.float32,
+                               device=device)
+        self.actions = torch.zeros((size, action_dim),
+                                   dtype=torch.float32,
+                                   device=device)
+        self.rewards = torch.zeros(size, dtype=torch.float32, device=device)
+        self.dones = torch.zeros(size, dtype=torch.float32, device=device)
+        self.logprobs = torch.zeros(size, dtype=torch.float32, device=device)
+        self.values = torch.zeros(size, dtype=torch.float32, device=device)
+
+    def add(self, obs, action, reward, done, logprob, value):
+        self.obs[self.ptr] = obs
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.dones[self.ptr] = done
+        self.logprobs[self.ptr] = logprob
+        self.values[self.ptr] = value
+        self.ptr += 1
+        if self.ptr >= self.size:
+            self.full = True
+
+    def get(self):
+        assert self.full, "Buffer not full yet!"
+        return self.obs, self.actions, self.rewards, self.dones, self.logprobs, self.values
+
+    def reset(self):
+        self.ptr = 0
+        self.full = False
+
+
+def compute_gae(rewards, values, dones, gamma, lam):
+    adv = torch.zeros_like(rewards)
+    lastgaelam = 0
+    for t in reversed(range(len(rewards))):
+        nextnonterminal = 1.0 - dones[t + 1] if t + 1 < len(rewards) else 0.0
+        nextvalue = values[t + 1] if t + 1 < len(rewards) else 0.0
+        delta = rewards[t] + gamma * nextvalue * nextnonterminal - values[t]
+        adv[t] = lastgaelam = delta + gamma * lam * nextnonterminal * lastgaelam
+    returns = adv + values
+    return adv, returns
 
 
 def train(cfg: DictConfig):
-    # Set up run directory and TensorBoard
     run_name = cfg.run_name or f"run_{time.strftime('%Y%m%d_%H%M%S')}"
     output_dir = to_absolute_path(cfg.output_dir)
     run_dir = os.path.join(output_dir, run_name)
@@ -581,77 +632,26 @@ def train(cfg: DictConfig):
     writer = SummaryWriter(log_dir=run_dir)
 
     device = torch.device("cuda")
-    replay = ReplayBuffer(cfg.train.replay_size)
-
     num_levels = cfg.env.num_levels
     actor = Actor(cfg, cfg.env.view_size, num_levels=num_levels).to(device)
-    critic1 = Critic(cfg, cfg.env.view_size, num_levels=num_levels).to(device)
-    critic2 = Critic(cfg, cfg.env.view_size, num_levels=num_levels).to(device)
-    target_critic1 = Critic(cfg, cfg.env.view_size,
-                            num_levels=num_levels).to(device)
-    target_critic2 = Critic(cfg, cfg.env.view_size,
-                            num_levels=num_levels).to(device)
-    target_critic1.load_state_dict(critic1.state_dict())
-    target_critic2.load_state_dict(critic2.state_dict())
-
+    critic = Critic(cfg, cfg.env.view_size, num_levels=num_levels).to(device)
     opt_actor = optim.Adam(actor.parameters(), lr=cfg.train.lr)
-    opt_critic1 = optim.Adam(critic1.parameters(), lr=cfg.train.lr)
-    opt_critic2 = optim.Adam(critic2.parameters(), lr=cfg.train.lr)
+    opt_critic = optim.Adam(critic.parameters(), lr=cfg.train.lr)
 
     gamma = cfg.train.gamma
-    tau = cfg.train.tau
-    alpha = cfg.train.alpha
+    lam = getattr(cfg.train, 'gae_lambda', 0.95)
     batch_size = cfg.train.batch_size
-    warmup = cfg.train.warmup
+    rollout_steps = cfg.train.rollout_steps
+    ppo_epochs = getattr(cfg.train, 'ppo_epochs', 4)
+    minibatch_size = getattr(cfg.train, 'minibatch_size', 64)
+    clip_eps = getattr(cfg.train, 'clip_eps', 0.2)
 
-    use_amp = getattr(cfg.train, 'use_amp',
-                      True)  # Default to True for backward compatibility
+    obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
+    action_dim = 2
+    buffer = RolloutBuffer(rollout_steps, obs_shape, action_dim, device)
 
-    # Dummy GradScaler for non-AMP mode
-    class DummyScaler:
-
-        def scale(self, loss):
-            return loss
-
-        def step(self, optimizer):
-            optimizer.step()
-
-        def update(self):
-            pass
-
-    scaler = torch.amp.GradScaler(device=device) if use_amp else DummyScaler()
-
-    def backward_and_step(loss, optimizer):
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-
-    total_steps = 0
-
-    # --- Load latest checkpoint if exists ---
-    latest_ep = 0
-    import re
-    actor_ckpts = [
-        f for f in os.listdir(run_dir) if re.match(r"actor_ep(\\d+)\\.pth", f)
-    ]
-    if actor_ckpts:
-        # Find the highest episode number
-        ep_nums = [
-            int(re.findall(r"actor_ep(\\d+)\\.pth", f)[0]) for f in actor_ckpts
-        ]
-        latest_ep = max(ep_nums)
-        actor_path = os.path.join(run_dir, f"actor_ep{latest_ep}.pth")
-        critic1_path = os.path.join(run_dir, f"critic1_ep{latest_ep}.pth")
-        if os.path.exists(actor_path):
-            print(f"[INFO] Loading actor weights from {actor_path}")
-            actor.load_state_dict(torch.load(actor_path))
-        if os.path.exists(critic1_path):
-            print(f"[INFO] Loading critic1 weights from {critic1_path}")
-            critic1.load_state_dict(torch.load(critic1_path))
-
-    # Use autocast context inline, and wrap scaler logic in a helper for elegance
-    for ep in range(latest_ep + 1, cfg.train.episodes + 1):
+    for ep in range(1, cfg.train.episodes + 1):
         ep_start_time = time.time()
-        # Create a new environment for each episode to avoid state carryover
         env = DrivingEnv(render_dir=run_dir if cfg.env.save_viz else None,
                          view_size=cfg.env.view_size,
                          dt=cfg.env.dt,
@@ -671,153 +671,66 @@ def train(cfg: DictConfig):
                          max_start_goal_dist=cfg.env.max_start_goal_dist)
         render_video = cfg.env.save_viz and (ep % cfg.env.render_every == 0)
         obs, _ = env.reset(render_video=render_video, episode_num=ep)
-        obs = torch.tensor(obs[None], dtype=torch.float32, device=device)
-        ep_reward_discounted = 0
-        ep_loss_q1 = 0
-        ep_loss_q2 = 0
-        ep_loss_pi = 0
-        updates = 0
+        obs = torch.tensor(obs, dtype=torch.float32, device=device)
         done = False
+        ep_reward = 0
+        buffer.reset()
         step_count = 0
-        # --- Only accumulators for discounted reward components ---
-        total_hitwall = 0.0
-        total_r_accel = 0.0
-        total_r_progress = 0.0
-        total_r_goal = 0.0
-        total_r_col = 0.0
-        gamma_pow = 1.0
-        with tqdm(total=cfg.train.max_steps, desc=f"Episode {ep}",
-                  leave=False) as pbar:
-            while not done:
-                total_steps += 1
-                with torch.no_grad():
-                    dist = actor(obs)
-                    # Assert actor output is valid
-                    mu = dist.mean
-                    std = dist.stddev
-                    assert torch.isfinite(
-                        mu).all(), "Actor mean contains NaN or Inf"
-                    assert torch.isfinite(
-                        std).all(), "Actor stddev contains NaN or Inf"
-                    action = dist.sample().cpu().numpy()[0]
-                next_obs, r, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                replay.push(obs.cpu().numpy()[0], action, r, next_obs, done)
-                obs = torch.tensor(next_obs[None],
-                                   dtype=torch.float32,
-                                   device=device)
-                ep_reward_discounted += gamma_pow * r
-                step_count += 1
-                pbar.update(1)
-                # --- Use info dict for discounted reward components ---
-                total_r_col += gamma_pow * info.get('r_col', 0.0)
-                total_r_goal += gamma_pow * info.get('r_goal', 0.0)
-                total_r_progress += gamma_pow * info.get('r_progress', 0.0)
-                total_r_accel += gamma_pow * info.get('r_accel', 0.0)
-                total_hitwall += gamma_pow * info.get('hitwall', 0.0)
-                gamma_pow *= gamma
-
-                if len(replay) > warmup:
-                    s, a, rew, s2, d = replay.sample(batch_size)
-                    s = torch.tensor(s, dtype=torch.float32, device=device)
-                    a = torch.tensor(a, dtype=torch.float32, device=device)
-                    rew = torch.tensor(rew, dtype=torch.float32,
-                                       device=device).unsqueeze(1)
-                    s2 = torch.tensor(s2, dtype=torch.float32, device=device)
-                    d = torch.tensor(d, dtype=torch.float32,
-                                     device=device).unsqueeze(1)
-
-                    with torch.amp.autocast(device_type='cuda',
-                                            enabled=use_amp):
-                        with torch.no_grad():
-                            dist_next = actor(s2)
-                            # Assert actor output is valid
-                            mu_next = dist_next.mean
-                            std_next = dist_next.stddev
-                            assert torch.isfinite(mu_next).all(
-                            ), "Actor mean (next) contains NaN or Inf"
-                            assert torch.isfinite(std_next).all(
-                            ), "Actor stddev (next) contains NaN or Inf"
-                            a2 = dist_next.rsample()
-                            logp2 = dist_next.log_prob(a2).sum(-1,
-                                                               keepdim=True)
-                            q1_target = target_critic1(s2, a2)
-                            q2_target = target_critic2(s2, a2)
-                            # Assert critic outputs are valid
-                            assert torch.isfinite(q1_target).all(
-                            ), "Critic1 target output contains NaN or Inf"
-                            assert torch.isfinite(q2_target).all(
-                            ), "Critic2 target output contains NaN or Inf"
-                            q_target = torch.min(q1_target,
-                                                 q2_target) - alpha * logp2
-                            y = rew + (1 - d) * gamma * q_target
-                        q1 = critic1(s, a)
-                        q2 = critic2(s, a)
-                        # Assert critic outputs are valid
-                        assert torch.isfinite(
-                            q1).all(), "Critic1 output contains NaN or Inf"
-                        assert torch.isfinite(
-                            q2).all(), "Critic2 output contains NaN or Inf"
-                        loss_q1 = F.mse_loss(q1, y)
-                        loss_q2 = F.mse_loss(q2, y)
-                    opt_critic1.zero_grad()
-                    backward_and_step(loss_q1, opt_critic1)
-                    opt_critic2.zero_grad()
-                    backward_and_step(loss_q2, opt_critic2)
-                    scaler.update()
-                    # actor update
-                    with torch.amp.autocast(device_type='cuda',
-                                            enabled=use_amp):
-                        dist_curr = actor(s)
-                        # Assert actor output is valid
-                        mu_curr = dist_curr.mean
-                        std_curr = dist_curr.stddev
-                        assert torch.isfinite(mu_curr).all(
-                        ), "Actor mean (curr) contains NaN or Inf"
-                        assert torch.isfinite(std_curr).all(
-                        ), "Actor stddev (curr) contains NaN or Inf"
-                        a_curr = dist_curr.rsample()
-                        logp = dist_curr.log_prob(a_curr).sum(-1, keepdim=True)
-                        q1_pi = critic1(s, a_curr)
-                        q2_pi = critic2(s, a_curr)
-                        # Assert critic outputs are valid
-                        assert torch.isfinite(q1_pi).all(
-                        ), "Critic1 pi output contains NaN or Inf"
-                        assert torch.isfinite(q2_pi).all(
-                        ), "Critic2 pi output contains NaN or Inf"
-                        loss_pi = (alpha * logp -
-                                   torch.min(q1_pi, q2_pi)).mean()
-                    opt_actor.zero_grad()
-                    backward_and_step(loss_pi, opt_actor)
-                    scaler.update()
-                    soft_update(critic1, target_critic1, tau)
-                    soft_update(critic2, target_critic2, tau)
-                    ep_loss_q1 += loss_q1.item()
-                    ep_loss_q2 += loss_q2.item()
-                    ep_loss_pi += loss_pi.item()
-                    updates += 1
-
+        while not buffer.full:
+            with torch.no_grad():
+                dist = actor(obs.unsqueeze(0))
+                action = dist.sample()[0]
+                logprob = dist.log_prob(action).sum()
+                value = critic(obs.unsqueeze(0), action.unsqueeze(0))[0, 0]
+            next_obs, reward, terminated, truncated, info = env.step(
+                action.cpu().numpy())
+            done = terminated or truncated
+            buffer.add(obs, action, reward, float(done), logprob, value)
+            obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+            ep_reward += reward
+            step_count += 1
+            if done:
+                obs, _ = env.reset(render_video=render_video, episode_num=ep)
+                obs = torch.tensor(obs, dtype=torch.float32, device=device)
+        # Compute GAE and returns
+        obs_buf, act_buf, rew_buf, done_buf, logp_buf, val_buf = buffer.get()
+        adv_buf, ret_buf = compute_gae(rew_buf, val_buf, done_buf, gamma, lam)
+        adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
+        # PPO update
+        inds = torch.randperm(rollout_steps)
+        for _ in range(ppo_epochs):
+            for start in range(0, rollout_steps, minibatch_size):
+                mb_inds = inds[start:start + minibatch_size]
+                mb_obs = obs_buf[mb_inds]
+                mb_act = act_buf[mb_inds]
+                mb_adv = adv_buf[mb_inds]
+                mb_ret = ret_buf[mb_inds]
+                mb_logp_old = logp_buf[mb_inds]
+                # Actor update
+                dist = actor(mb_obs)
+                logp = dist.log_prob(mb_act).sum(-1)
+                ratio = (logp - mb_logp_old).exp()
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps,
+                                    1.0 + clip_eps) * mb_adv
+                loss_pi = -torch.min(surr1, surr2).mean()
+                opt_actor.zero_grad()
+                loss_pi.backward()
+                opt_actor.step()
+                # Critic update
+                value = critic(mb_obs, mb_act).squeeze(-1)
+                loss_v = F.mse_loss(value, mb_ret)
+                opt_critic.zero_grad()
+                loss_v.backward()
+                opt_critic.step()
         ep_time = time.time() - ep_start_time
-        avg_loss_q1 = ep_loss_q1 / updates if updates > 0 else 0
-        avg_loss_q2 = ep_loss_q2 / updates if updates > 0 else 0
-        avg_loss_pi = ep_loss_pi / updates if updates > 0 else 0
-        print(
-            f"Episode {ep} Discounted Reward: {ep_reward_discounted:.2f} | Time: {ep_time:.3f} seconds | LossQ1: {avg_loss_q1:.4f} | LossQ2: {avg_loss_q2:.4f} | LossPi: {avg_loss_pi:.4f}"
-        )
-        # --- Print only discounted costs for each kind ---
-        print(
-            f"[Episode {ep} Discounted Totals] hitwall: {total_hitwall:.2f}, accel: {total_r_accel:.2f}, progress: {total_r_progress:.2f}, goal: {total_r_goal:.2f}, col: {total_r_col:.2f}"
-        )
-        writer.add_scalar('Reward/Episode', ep_reward_discounted, ep)
-        writer.add_scalar('Loss/Q1', avg_loss_q1, ep)
-        writer.add_scalar('Loss/Q2', avg_loss_q2, ep)
-        writer.add_scalar('Loss/Policy', avg_loss_pi, ep)
+        print(f"Episode {ep} Reward: {ep_reward:.2f} | Time: {ep_time:.3f} s")
+        writer.add_scalar('Reward/Episode', ep_reward, ep)
         writer.add_scalar('Time/Episode', ep_time, ep)
-        # save every N eps
         if ep % cfg.train.save_every == 0:
             torch.save(actor.state_dict(),
                        os.path.join(run_dir, f"actor_ep{ep}.pth"))
-            torch.save(critic1.state_dict(),
+            torch.save(critic.state_dict(),
                        os.path.join(run_dir, f"critic1_ep{ep}.pth"))
     writer.close()
 
