@@ -63,10 +63,24 @@ class DrivingEnv(gym.Env):
     # metadata = {'render.modes': ['human']}
     metadata = {'render.modes': []}
 
-    def __init__(self, view_size, dt, a_max, v_max, w_col, R_goal, disk_radius,
-                 render_dir, video_fps, w_dist, w_accel, max_steps,
-                 hitwall_cost, pyramid_scales, num_levels,
-                 min_start_goal_dist=50, max_start_goal_dist=200):
+    def __init__(self,
+                 view_size,
+                 dt,
+                 a_max,
+                 v_max,
+                 w_col,
+                 R_goal,
+                 disk_radius,
+                 render_dir,
+                 video_fps,
+                 w_dist,
+                 w_accel,
+                 max_steps,
+                 hitwall_cost,
+                 pyramid_scales,
+                 num_levels,
+                 min_start_goal_dist=50,
+                 max_start_goal_dist=200):
         super().__init__()
         self.map_h, self.map_w = 512, 512
         self.view_size = view_size
@@ -92,7 +106,7 @@ class DrivingEnv(gym.Env):
         self.num_levels = num_levels
         self.observation_space = spaces.Box(low=0.0,
                                             high=1.0,
-                                            shape=(self.num_levels, 3,
+                                            shape=(self.num_levels, 4,
                                                    view_size, view_size),
                                             dtype=np.float32)
         self.seed()
@@ -167,7 +181,8 @@ class DrivingEnv(gym.Env):
                         queue.append((ny, nx))
 
             # Collect all positions within [min_dist, max_dist] (in L2 distance)
-            pts = np.argwhere((visited) & (dists >= min_dist) & (dists <= max_dist))
+            pts = np.argwhere((visited) & (dists >= min_dist)
+                              & (dists <= max_dist))
             # drop the target itself
             pts = pts[~((pts[:, 0] == ty) & (pts[:, 1] == tx))]
             if len(pts) == 0:
@@ -178,7 +193,9 @@ class DrivingEnv(gym.Env):
             self.start = np.array([sx, sy], dtype=np.int32)
             self.target = np.array([tx, ty], dtype=np.int32)
             elapsed = time.time() - start_time
-            print(f"[DrivingEnv] Map generated in {elapsed:.3f} seconds. Start-goal dist: {dists[sy, sx]:.1f}")
+            print(
+                f"[DrivingEnv] Map generated in {elapsed:.3f} seconds. Start-goal dist: {dists[sy, sx]:.1f}"
+            )
             break
 
     def visualize_map(self, filename='map.png'):
@@ -287,12 +304,16 @@ class DrivingEnv(gym.Env):
             }
             # Render this step: collect frame for imageio
             if self.render_dir and self._video_frames is not None:
-                frame = self.get_human_frame(action=action, canvas_size=self.canvas_size)
+                frame = self.get_human_frame(action=action,
+                                             canvas_size=self.canvas_size)
                 # Convert BGR (OpenCV) to RGB for imageio
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 self._video_frames.append(frame_rgb)
                 if terminated or truncated:
-                    imageio.mimsave(self._video_path, self._video_frames, fps=self.video_fps, codec='libx264')
+                    imageio.mimsave(self._video_path,
+                                    self._video_frames,
+                                    fps=self.video_fps,
+                                    codec='libx264')
                     self._video_frames = None
             return obs, reward, terminated, truncated, info
 
@@ -326,16 +347,19 @@ class DrivingEnv(gym.Env):
             'r_col': r_col
         }
 
-
         # Render this step: collect frame for imageio
         if self.render_dir and self._video_frames is not None:
-            frame = self.get_human_frame(action=action, canvas_size=self.canvas_size)
+            frame = self.get_human_frame(action=action,
+                                         canvas_size=self.canvas_size)
             # Convert BGR (OpenCV) to RGB for imageio
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             self._video_frames.append(frame_rgb)
             # Save video if episode ends by termination or truncation
             if terminated or truncated:
-                imageio.mimsave(self._video_path, self._video_frames, fps=self.video_fps, codec='libx264')
+                imageio.mimsave(self._video_path,
+                                self._video_frames,
+                                fps=self.video_fps,
+                                codec='libx264')
                 self._video_frames = None
         return obs, reward, terminated, truncated, info
 
@@ -671,8 +695,10 @@ def train(cfg: DictConfig):
                     # Assert actor output is valid
                     mu = dist.mean
                     std = dist.stddev
-                    assert torch.isfinite(mu).all(), "Actor mean contains NaN or Inf"
-                    assert torch.isfinite(std).all(), "Actor stddev contains NaN or Inf"
+                    assert torch.isfinite(
+                        mu).all(), "Actor mean contains NaN or Inf"
+                    assert torch.isfinite(
+                        std).all(), "Actor stddev contains NaN or Inf"
                     action = dist.sample().cpu().numpy()[0]
                 next_obs, r, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
@@ -708,24 +734,30 @@ def train(cfg: DictConfig):
                             # Assert actor output is valid
                             mu_next = dist_next.mean
                             std_next = dist_next.stddev
-                            assert torch.isfinite(mu_next).all(), "Actor mean (next) contains NaN or Inf"
-                            assert torch.isfinite(std_next).all(), "Actor stddev (next) contains NaN or Inf"
+                            assert torch.isfinite(mu_next).all(
+                            ), "Actor mean (next) contains NaN or Inf"
+                            assert torch.isfinite(std_next).all(
+                            ), "Actor stddev (next) contains NaN or Inf"
                             a2 = dist_next.rsample()
                             logp2 = dist_next.log_prob(a2).sum(-1,
                                                                keepdim=True)
                             q1_target = target_critic1(s2, a2)
                             q2_target = target_critic2(s2, a2)
                             # Assert critic outputs are valid
-                            assert torch.isfinite(q1_target).all(), "Critic1 target output contains NaN or Inf"
-                            assert torch.isfinite(q2_target).all(), "Critic2 target output contains NaN or Inf"
+                            assert torch.isfinite(q1_target).all(
+                            ), "Critic1 target output contains NaN or Inf"
+                            assert torch.isfinite(q2_target).all(
+                            ), "Critic2 target output contains NaN or Inf"
                             q_target = torch.min(q1_target,
                                                  q2_target) - alpha * logp2
                             y = rew + (1 - d) * gamma * q_target
                         q1 = critic1(s, a)
                         q2 = critic2(s, a)
                         # Assert critic outputs are valid
-                        assert torch.isfinite(q1).all(), "Critic1 output contains NaN or Inf"
-                        assert torch.isfinite(q2).all(), "Critic2 output contains NaN or Inf"
+                        assert torch.isfinite(
+                            q1).all(), "Critic1 output contains NaN or Inf"
+                        assert torch.isfinite(
+                            q2).all(), "Critic2 output contains NaN or Inf"
                         loss_q1 = F.mse_loss(q1, y)
                         loss_q2 = F.mse_loss(q2, y)
                     opt_critic1.zero_grad()
@@ -740,15 +772,19 @@ def train(cfg: DictConfig):
                         # Assert actor output is valid
                         mu_curr = dist_curr.mean
                         std_curr = dist_curr.stddev
-                        assert torch.isfinite(mu_curr).all(), "Actor mean (curr) contains NaN or Inf"
-                        assert torch.isfinite(std_curr).all(), "Actor stddev (curr) contains NaN or Inf"
+                        assert torch.isfinite(mu_curr).all(
+                        ), "Actor mean (curr) contains NaN or Inf"
+                        assert torch.isfinite(std_curr).all(
+                        ), "Actor stddev (curr) contains NaN or Inf"
                         a_curr = dist_curr.rsample()
                         logp = dist_curr.log_prob(a_curr).sum(-1, keepdim=True)
                         q1_pi = critic1(s, a_curr)
                         q2_pi = critic2(s, a_curr)
                         # Assert critic outputs are valid
-                        assert torch.isfinite(q1_pi).all(), "Critic1 pi output contains NaN or Inf"
-                        assert torch.isfinite(q2_pi).all(), "Critic2 pi output contains NaN or Inf"
+                        assert torch.isfinite(q1_pi).all(
+                        ), "Critic1 pi output contains NaN or Inf"
+                        assert torch.isfinite(q2_pi).all(
+                        ), "Critic2 pi output contains NaN or Inf"
                         loss_pi = (alpha * logp -
                                    torch.min(q1_pi, q2_pi)).mean()
                     opt_actor.zero_grad()
@@ -766,9 +802,12 @@ def train(cfg: DictConfig):
         avg_loss_q2 = ep_loss_q2 / updates if updates > 0 else 0
         avg_loss_pi = ep_loss_pi / updates if updates > 0 else 0
         print(
-            f"Episode {ep} Discounted Reward: {ep_reward_discounted:.2f} | Time: {ep_time:.3f} seconds | LossQ1: {avg_loss_q1:.4f} | LossQ2: {avg_loss_q2:.4f} | LossPi: {avg_loss_pi:.4f}")
+            f"Episode {ep} Discounted Reward: {ep_reward_discounted:.2f} | Time: {ep_time:.3f} seconds | LossQ1: {avg_loss_q1:.4f} | LossQ2: {avg_loss_q2:.4f} | LossPi: {avg_loss_pi:.4f}"
+        )
         # --- Print only discounted costs for each kind ---
-        print(f"[Episode {ep} Discounted Totals] hitwall: {total_hitwall:.2f}, accel: {total_r_accel:.2f}, progress: {total_r_progress:.2f}, goal: {total_r_goal:.2f}, col: {total_r_col:.2f}")
+        print(
+            f"[Episode {ep} Discounted Totals] hitwall: {total_hitwall:.2f}, accel: {total_r_accel:.2f}, progress: {total_r_progress:.2f}, goal: {total_r_goal:.2f}, col: {total_r_col:.2f}"
+        )
         writer.add_scalar('Reward/Episode', ep_reward_discounted, ep)
         writer.add_scalar('Loss/Q1', avg_loss_q1, ep)
         writer.add_scalar('Loss/Q2', avg_loss_q2, ep)
