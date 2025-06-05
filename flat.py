@@ -115,6 +115,7 @@ class DrivingEnv(gym.Env):
         self._step_count = 0
         self.min_start_goal_dist = min_start_goal_dist
         self.max_start_goal_dist = max_start_goal_dist
+        self.is_done = None
 
     def seed(self, seed=None):
         if seed is not None:
@@ -228,13 +229,8 @@ class DrivingEnv(gym.Env):
         path = os.path.join(self.render_dir, filename)
         cv2.imwrite(path, vis)
 
-    def reset(self,
-              *,
-              seed=None,
-              options=None,
-              render_video=None,
-              episode_num=None):
-        episode_start_time = time.time()
+    def reset(self, *, seed=None, options=None, episode_num=None):
+        self.is_done = False
         if seed is not None:
             self.seed(seed)
         # Regenerate the map for each episode
@@ -249,11 +245,14 @@ class DrivingEnv(gym.Env):
         self.pos = self.start.astype(np.float32)
         self.vel = np.zeros(2, dtype=np.float32)
         obs = self._get_obs()
-        self._episode_start_time = episode_start_time  # Save for timing in step
         self._step_count = 0  # Reset step counter
+        self._prev_dist_to_goal = np.linalg.norm(self.pos - self.target)
+
         return obs, {}
 
     def step(self, action):
+        assert self.is_done is not None
+        assert not self.is_done
         # Limit acceleration by norm (ball projection)
         a = np.array(action)
         a_norm = np.linalg.norm(a)
@@ -291,6 +290,7 @@ class DrivingEnv(gym.Env):
                 'r_goal': 0.0,
                 'r_col': 0.0
             }
+            self.is_done = terminated or truncated
             return obs, reward, terminated, truncated, info
 
         # collision (single agent skip)
@@ -301,8 +301,6 @@ class DrivingEnv(gym.Env):
         terminated = dist_to_goal < self.disk_radius * 2
         r_goal = self.R_goal if terminated else 0.0
         # Progress reward: positive if moving closer to goal
-        if not hasattr(self, '_prev_dist_to_goal'):
-            self._prev_dist_to_goal = dist_to_goal
         progress = self._prev_dist_to_goal - dist_to_goal
         r_progress = self.w_dist * progress  # per-pixel, not normalized
         self._prev_dist_to_goal = dist_to_goal
@@ -322,6 +320,7 @@ class DrivingEnv(gym.Env):
             'r_col': r_col
         }
 
+        self.is_done = terminated or truncated
         return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
@@ -463,30 +462,13 @@ class DrivingEnv(gym.Env):
         ]
         y0 = 30
         for i, line in enumerate(info_lines):
-            cv2.putText(frame, line, (10, y0 + i * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
-            cv2.putText(frame, line, (10, y0 + i * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 1, cv2.LINE_AA)
+            cv2.putText(frame, line, (10, y0 + i * 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
+                        cv2.LINE_AA)
+            cv2.putText(frame, line, (10, y0 + i * 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1,
+                        cv2.LINE_AA)
         return frame
-
-
-##########################
-# 2. Replay Buffer
-##########################
-class ReplayBuffer:
-
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        return np.stack(states), np.stack(actions), np.array(rewards, dtype=np.float32), \
-               np.stack(next_states), np.array(dones, dtype=np.float32)
-
-    def __len__(self):
-        return len(self.buffer)
 
 
 ##########################
@@ -532,7 +514,8 @@ class Actor(nn.Module):
         mu = self.mu_head(x)
         log_std = self.log_std_head(x)
         log_std = torch.tanh(log_std)
-        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX -
+                                            self.LOG_STD_MIN) * (log_std + 1)
         std = log_std.exp()
         dist = torch.distributions.Normal(mu, std)
         return dist
@@ -540,18 +523,16 @@ class Actor(nn.Module):
 
 class Critic(nn.Module):
 
-    def __init__(self, cfg, view_size, action_dim=2, num_levels=3):
+    def __init__(self, cfg, view_size, num_levels=3):
         super().__init__()
         self.encoder = make_encoder(cfg, view_size, num_levels)
         self.net = nn.Sequential(
             nn.Linear((self.encoder.fc_out.out_features if hasattr(
-                self.encoder, 'fc_out') else self.encoder.out_dim) +
-                      action_dim, 128), nn.ReLU(), nn.Linear(128, 128),
-            nn.ReLU(), nn.Linear(128, 1))
+                self.encoder, 'fc_out') else self.encoder.out_dim), 128),
+            nn.ReLU(), nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, 1))
 
-    def forward(self, obs, action):
-        h = self.encoder(obs)
-        x = torch.cat([h, action], dim=1)
+    def forward(self, obs):
+        x = self.encoder(obs)
         return self.net(x)
 
 
@@ -572,15 +553,17 @@ class RolloutBuffer:
                                    dtype=torch.float32,
                                    device=device)
         self.rewards = torch.zeros(size, dtype=torch.float32, device=device)
-        self.dones = torch.zeros(size, dtype=torch.float32, device=device)
+        self.is_terminals = torch.zeros(size,
+                                        dtype=torch.float32,
+                                        device=device)
         self.logprobs = torch.zeros(size, dtype=torch.float32, device=device)
         self.values = torch.zeros(size, dtype=torch.float32, device=device)
 
-    def add(self, obs, action, reward, done, logprob, value):
+    def add(self, obs, action, reward, is_terminal, logprob, value):
         self.obs[self.ptr] = obs
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
-        self.dones[self.ptr] = done
+        self.is_terminals[self.ptr] = is_terminal
         self.logprobs[self.ptr] = logprob
         self.values[self.ptr] = value
         self.ptr += 1
@@ -589,21 +572,25 @@ class RolloutBuffer:
 
     def get(self):
         assert self.full, "Buffer not full yet!"
-        return self.obs, self.actions, self.rewards, self.dones, self.logprobs, self.values
+        return self.obs, self.actions, self.rewards, self.is_terminals, self.logprobs, self.values
 
     def reset(self):
         self.ptr = 0
         self.full = False
 
 
-def compute_gae(rewards, values, dones, gamma, lam):
+def compute_gae(rewards, values, is_terminals, gamma, lam, the_extra_value, is_next_terminal):
     adv = torch.zeros_like(rewards)
     lastgaelam = 0
     for t in reversed(range(len(rewards))):
-        nextnonterminal = 1.0 - dones[t + 1] if t + 1 < len(rewards) else 0.0
-        nextvalue = values[t + 1] if t + 1 < len(rewards) else 0.0
-        delta = rewards[t] + gamma * nextvalue * nextnonterminal - values[t]
-        adv[t] = lastgaelam = delta + gamma * lam * nextnonterminal * lastgaelam
+        if t == len(rewards) - 1:
+            episode_continues = 1.0 - is_next_terminal
+            next_value = the_extra_value
+        else:
+            episode_continues = 1.0 - is_terminals[t + 1]
+            next_value = values[t + 1]
+        delta = rewards[t] + gamma * next_value * episode_continues - values[t]
+        adv[t] = lastgaelam = delta + gamma * lam * episode_continues * lastgaelam
     returns = adv + values
     return adv, returns
 
@@ -643,25 +630,23 @@ def train(cfg: DictConfig):
     action_dim = 2
     buffer = RolloutBuffer(rollout_steps, obs_shape, action_dim, device)
 
-    def make_env():
-        return DrivingEnv(
-            render_dir=run_dir,
-            view_size=cfg.env.view_size,
-            dt=cfg.env.dt,
-            a_max=cfg.env.a_max,
-            v_max=cfg.env.v_max,
-            w_col=cfg.env.w_col,
-            R_goal=cfg.env.R_goal,
-            disk_radius=cfg.env.disk_radius,
-            video_fps=cfg.env.video_fps,
-            w_dist=cfg.env.w_dist,
-            w_accel=cfg.env.w_accel,
-            max_steps=cfg.train.max_steps,
-            hitwall_cost=cfg.env.hitwall_cost,
-            pyramid_scales=cfg.env.pyramid_scales,
-            num_levels=cfg.env.num_levels,
-            min_start_goal_dist=cfg.env.min_start_goal_dist,
-            max_start_goal_dist=cfg.env.max_start_goal_dist)
+    env = DrivingEnv(render_dir=run_dir,
+                     view_size=cfg.env.view_size,
+                     dt=cfg.env.dt,
+                     a_max=cfg.env.a_max,
+                     v_max=cfg.env.v_max,
+                     w_col=cfg.env.w_col,
+                     R_goal=cfg.env.R_goal,
+                     disk_radius=cfg.env.disk_radius,
+                     video_fps=cfg.env.video_fps,
+                     w_dist=cfg.env.w_dist,
+                     w_accel=cfg.env.w_accel,
+                     max_steps=cfg.train.max_steps,
+                     hitwall_cost=cfg.env.hitwall_cost,
+                     pyramid_scales=cfg.env.pyramid_scales,
+                     num_levels=cfg.env.num_levels,
+                     min_start_goal_dist=cfg.env.min_start_goal_dist,
+                     max_start_goal_dist=cfg.env.max_start_goal_dist)
 
     num_rollouts = cfg.train.num_rollouts
     rollout_steps = cfg.train.rollout_steps
@@ -671,48 +656,72 @@ def train(cfg: DictConfig):
         print(f"[INFO] Rollout {rollout_idx}: Start recording transitions...")
         rollout_reward = 0
         buffer.reset()
-        steps_collected = 0
         record_start_time = time.time()
         # --- Video recording for the whole rollout ---
         video_frames = []
         video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}.mp4")
-        while steps_collected < rollout_steps:
-            env = make_env()
-            obs, _ = env.reset(render_video=False, episode_num=episode_num)
-            episode_num += 1
-            obs = torch.tensor(obs, dtype=torch.float32, device=device)
-            done = False
-            ep_reward = 0
-            while not done and steps_collected < rollout_steps:
-                with torch.no_grad():
-                    dist = actor(obs.unsqueeze(0))
-                    action = dist.sample()[0]
-                    logprob = dist.log_prob(action).sum()
-                    value = critic(obs.unsqueeze(0), action.unsqueeze(0))[0, 0]
+        next_obs, _ = env.reset(episode_num=episode_num)
+        next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+        episode_num += 1
+        is_next_terminal = False
+
+        for _ in range(rollout_steps):
+            cur_obs = next_obs
+            is_current_terminal = is_next_terminal
+            with torch.no_grad():
+                dist = actor(cur_obs.unsqueeze(0))
+                action = dist.sample()[0]
+                logprob = dist.log_prob(action).sum()
+                value = critic(cur_obs.unsqueeze(0))[0, 0]
+
+            if is_current_terminal:
+                next_obs, _ = env.reset(episode_num=episode_num)
+                episode_num += 1
+                next_obs = torch.tensor(next_obs,
+                                        dtype=torch.float32,
+                                        device=device)
+                reward = 0.0
+                terminated = False
+                truncated = False
+                info = None
+            else:
                 next_obs, reward, terminated, truncated, info = env.step(
                     action.cpu().numpy())
-                # Store reward info for visualization
-                # --- Collect frame for video ---
-                frame = env.get_human_frame(action=action.cpu().numpy(), canvas_size=env.canvas_size, info=info)
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                video_frames.append(frame_rgb)
-                # ---
-                done = terminated or truncated
-                buffer.add(obs, action, reward, float(done), logprob, value)
-                obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
-                ep_reward += reward
-                steps_collected += 1
-                if done and steps_collected < rollout_steps:
-                    del env
-                    break
-            rollout_reward += ep_reward
+                next_obs = torch.tensor(next_obs,
+                                        dtype=torch.float32,
+                                        device=device)
+
+            # Store reward info for visualization
+            # --- Collect frame for video ---
+            frame = env.get_human_frame(action=action.cpu().numpy(),
+                                        canvas_size=env.canvas_size,
+                                        info=info)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            video_frames.append(frame_rgb)
+            # ---
+
+            buffer.add(cur_obs, action, reward, float(is_current_terminal),
+                       logprob, value)
+
+            is_next_terminal = terminated or truncated
+
+            rollout_reward += reward
+        
+        with torch.no_grad():
+            next_value = critic(next_obs.unsqueeze(0))[0, 0]
+
         # --- Save video for this rollout ---
-        imageio.mimsave(video_path, video_frames, fps=cfg.env.video_fps, codec='libx264')
+        imageio.mimsave(video_path,
+                        video_frames,
+                        fps=cfg.env.video_fps,
+                        codec='libx264')
         record_time = time.time() - record_start_time
         update_start_time = time.time()
         # Compute GAE and returns
-        obs_buf, act_buf, rew_buf, done_buf, logp_buf, val_buf = buffer.get()
-        adv_buf, ret_buf = compute_gae(rew_buf, val_buf, done_buf, gamma, lam)
+        obs_buf, act_buf, rew_buf, terminal_buf, logp_buf, val_buf = buffer.get(
+        )
+        adv_buf, ret_buf = compute_gae(rew_buf, val_buf, terminal_buf, gamma,
+                                       lam, next_value, is_next_terminal)
         adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
         # PPO update
         inds = torch.randperm(rollout_steps)
@@ -743,15 +752,21 @@ def train(cfg: DictConfig):
                 opt_critic.step()
         update_time = time.time() - update_start_time
         rollout_time = time.time() - rollout_start_time
-        print(f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s.")
-        print(f"[INFO] Rollout {rollout_idx}: TotalReward: {rollout_reward:.2f} | TotalTime: {rollout_time:.3f} s\n")
+        print(
+            f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s."
+        )
+        print(
+            f"[INFO] Rollout {rollout_idx}: TotalReward: {rollout_reward:.2f} | TotalTime: {rollout_time:.3f} s\n"
+        )
         writer.add_scalar('Reward/Rollout', rollout_reward, rollout_idx)
         writer.add_scalar('Time/Rollout', rollout_time, rollout_idx)
         writer.add_scalar('Time/Recording', record_time, rollout_idx)
         writer.add_scalar('Time/Update', update_time, rollout_idx)
         if rollout_idx % cfg.train.save_every == 0:
-            torch.save(actor.state_dict(), os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))
-            torch.save(critic.state_dict(), os.path.join(run_dir, f"critic1_ep{rollout_idx}.pth"))
+            torch.save(actor.state_dict(),
+                       os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))
+            torch.save(critic.state_dict(),
+                       os.path.join(run_dir, f"critic1_ep{rollout_idx}.pth"))
     writer.close()
 
 
