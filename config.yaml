@@ -13,14 +13,14 @@ env:
   disk_radius: 2.0
   render_dir: ${hydra:run.dir}/viz
   video_fps: 30
-  w_dist: 50.0
+  w_dist: 1.0
   w_accel: 0.1
   save_viz: true
   render_every: 1  # Render every N episodes
   hitwall_cost: -100.0
   pyramid_scales: [1, 4, 16]
   num_levels: 3
-  min_start_goal_dist: 5   # Minimum allowed distance between start and goal
+  min_start_goal_dist: 15   # Minimum allowed distance between start and goal
   max_start_goal_dist: 30  # Maximum allowed distance between start and goal
 
 # Training
@@ -30,11 +30,12 @@ train:
   gae_lambda: 0.95
   rollout_steps: 2048
   ppo_epochs: 4
-  batch_size: 64
+  minibatch_size: 64
   clip_eps: 0.2
   episodes: 500
   max_steps: 2000
-  save_every: 50
+  save_every: 10
+  num_rollouts: 1000 
 
 # Logging
 log_dir: ${hydra:run.dir}/tb
@@ -50,3 +51,7 @@ model:
   type: conv   # Options: 'vit' or 'conv'
   vit_embed_dim: 128
   conv_out_dim: 384
+
+# Debug and snapshot loading
+load_actor_path: null
+load_critic_path: null

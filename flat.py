@@ -104,7 +104,7 @@ class DrivingEnv(gym.Env):
                                        dtype=np.float32)
         self.pyramid_scales = list(pyramid_scales)
         self.num_levels = num_levels
-        self.observation_space = spaces.Box(low=0.0,
+        self.observation_space = spaces.Box(low=-1.0,
                                             high=1.0,
                                             shape=(self.num_levels, 4,
                                                    view_size, view_size),
@@ -242,23 +242,12 @@ class DrivingEnv(gym.Env):
         # Use episode_num for debug file naming
         self._current_episode_num = episode_num if episode_num is not None else 1
         # Dump global map visualization for this episode
-        if self.render_dir:
-            self.visualize_map(
-                filename=f"map_ep{self._current_episode_num:03d}.png")
+        # if self.render_dir:
+        #     self.visualize_map(
+        #         filename=f"map_ep{self._current_episode_num:05d}.png")
         # Set agent to the designated start position from map generation
         self.pos = self.start.astype(np.float32)
         self.vel = np.zeros(2, dtype=np.float32)
-
-        # Use render_video argument to decide video_writer
-        if render_video:
-            video_path = os.path.join(
-                self.render_dir,
-                f'episode_{self._current_episode_num:03d}.mp4')
-            self._video_path = video_path
-            self._video_frames = []
-        else:
-            self._video_path = None
-            self._video_frames = None
         obs = self._get_obs()
         self._episode_start_time = episode_start_time  # Save for timing in step
         self._step_count = 0  # Reset step counter
@@ -302,19 +291,6 @@ class DrivingEnv(gym.Env):
                 'r_goal': 0.0,
                 'r_col': 0.0
             }
-            # Render this step: collect frame for imageio
-            if self.render_dir and self._video_frames is not None:
-                frame = self.get_human_frame(action=action,
-                                             canvas_size=self.canvas_size)
-                # Convert BGR (OpenCV) to RGB for imageio
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                self._video_frames.append(frame_rgb)
-                if terminated or truncated:
-                    imageio.mimsave(self._video_path,
-                                    self._video_frames,
-                                    fps=self.video_fps,
-                                    codec='libx264')
-                    self._video_frames = None
             return obs, reward, terminated, truncated, info
 
         # collision (single agent skip)
@@ -325,11 +301,10 @@ class DrivingEnv(gym.Env):
         terminated = dist_to_goal < self.disk_radius * 2
         r_goal = self.R_goal if terminated else 0.0
         # Progress reward: positive if moving closer to goal
-        max_dist = np.linalg.norm([self.map_w, self.map_h])
         if not hasattr(self, '_prev_dist_to_goal'):
             self._prev_dist_to_goal = dist_to_goal
         progress = self._prev_dist_to_goal - dist_to_goal
-        r_progress = self.w_dist * (progress / max_dist)
+        r_progress = self.w_dist * progress  # per-pixel, not normalized
         self._prev_dist_to_goal = dist_to_goal
         # Acceleration penalty (normalized)
         a_norm = np.linalg.norm(action)
@@ -347,20 +322,6 @@ class DrivingEnv(gym.Env):
             'r_col': r_col
         }
 
-        # Render this step: collect frame for imageio
-        if self.render_dir and self._video_frames is not None:
-            frame = self.get_human_frame(action=action,
-                                         canvas_size=self.canvas_size)
-            # Convert BGR (OpenCV) to RGB for imageio
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            self._video_frames.append(frame_rgb)
-            # Save video if episode ends by termination or truncation
-            if terminated or truncated:
-                imageio.mimsave(self._video_path,
-                                self._video_frames,
-                                fps=self.video_fps,
-                                codec='libx264')
-                self._video_frames = None
         return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
@@ -439,11 +400,12 @@ class DrivingEnv(gym.Env):
                          interpolation=cv2.INTER_NEAREST)
         return img
 
-    def get_human_frame(self, action=None, canvas_size=256):
+    def get_human_frame(self, action=None, canvas_size=256, info=None):
         """
         Generate a high-res visualization for human viewing.
         - Uses the current observation as the base image for each level
         - Draws velocity and action vectors as overlays
+        - Overlays reward info from the provided info dict (if any)
         """
         obs = self._get_obs()  # shape: (num_levels, 3, H, W)
         vis_levels = []
@@ -482,6 +444,27 @@ class DrivingEnv(gym.Env):
                                     tipLength=0.3)
             vis_levels.append(img)
         frame = np.concatenate(vis_levels, axis=1)
+        # --- Overlay text info ---
+        # Use info dict if provided, else fallback to zeros
+        if info is None:
+            info = {}
+        r_accel = info.get('r_accel', 0.0)
+        r_progress = info.get('r_progress', 0.0)
+        r_goal = info.get('r_goal', 0.0)
+        r_col = info.get('r_col', 0.0)
+        hitwall = info.get('hitwall', 0.0)
+        info_lines = [
+            f"r_progress: {r_progress:.2f}",
+            f"r_accel: {r_accel:.2f}",
+            f"r_goal: {r_goal:.2f}",
+            f"r_col: {r_col:.2f}",
+            f"hitwall: {hitwall:.2f}",
+            f"Total reward: {(r_accel + r_progress + r_goal + r_col + hitwall):.2f}",
+        ]
+        y0 = 30
+        for i, line in enumerate(info_lines):
+            cv2.putText(frame, line, (10, y0 + i * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
+            cv2.putText(frame, line, (10, y0 + i * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 1, cv2.LINE_AA)
         return frame
 
 
@@ -540,7 +523,7 @@ class Actor(nn.Module):
         )
         self.mu_head = nn.Linear(128, action_dim)
         self.log_std_head = nn.Linear(128, action_dim)
-        self.LOG_STD_MIN = -20
+        self.LOG_STD_MIN = -5
         self.LOG_STD_MAX = 2
 
     def forward(self, obs):
@@ -548,7 +531,8 @@ class Actor(nn.Module):
         x = self.net(h)
         mu = self.mu_head(x)
         log_std = self.log_std_head(x)
-        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        log_std = torch.tanh(log_std)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
         std = log_std.exp()
         dist = torch.distributions.Normal(mu, std)
         return dist
@@ -638,9 +622,18 @@ def train(cfg: DictConfig):
     opt_actor = optim.Adam(actor.parameters(), lr=cfg.train.lr)
     opt_critic = optim.Adam(critic.parameters(), lr=cfg.train.lr)
 
+    # === Load from snapshot if specified ===
+    if cfg.load_actor_path:
+        actor_path = cfg.load_actor_path
+        print(f"[INFO] Loading actor weights from {actor_path}")
+        actor.load_state_dict(torch.load(actor_path, map_location=device))
+    if cfg.load_critic_path:
+        critic_path = cfg.load_critic_path
+        print(f"[INFO] Loading critic weights from {critic_path}")
+        critic.load_state_dict(torch.load(critic_path, map_location=device))
+
     gamma = cfg.train.gamma
     lam = getattr(cfg.train, 'gae_lambda', 0.95)
-    batch_size = cfg.train.batch_size
     rollout_steps = cfg.train.rollout_steps
     ppo_epochs = getattr(cfg.train, 'ppo_epochs', 4)
     minibatch_size = getattr(cfg.train, 'minibatch_size', 64)
@@ -650,48 +643,73 @@ def train(cfg: DictConfig):
     action_dim = 2
     buffer = RolloutBuffer(rollout_steps, obs_shape, action_dim, device)
 
-    for ep in range(1, cfg.train.episodes + 1):
-        ep_start_time = time.time()
-        env = DrivingEnv(render_dir=run_dir if cfg.env.save_viz else None,
-                         view_size=cfg.env.view_size,
-                         dt=cfg.env.dt,
-                         a_max=cfg.env.a_max,
-                         v_max=cfg.env.v_max,
-                         w_col=cfg.env.w_col,
-                         R_goal=cfg.env.R_goal,
-                         disk_radius=cfg.env.disk_radius,
-                         video_fps=cfg.env.video_fps,
-                         w_dist=cfg.env.w_dist,
-                         w_accel=cfg.env.w_accel,
-                         max_steps=cfg.train.max_steps,
-                         hitwall_cost=cfg.env.hitwall_cost,
-                         pyramid_scales=cfg.env.pyramid_scales,
-                         num_levels=cfg.env.num_levels,
-                         min_start_goal_dist=cfg.env.min_start_goal_dist,
-                         max_start_goal_dist=cfg.env.max_start_goal_dist)
-        render_video = cfg.env.save_viz and (ep % cfg.env.render_every == 0)
-        obs, _ = env.reset(render_video=render_video, episode_num=ep)
-        obs = torch.tensor(obs, dtype=torch.float32, device=device)
-        done = False
-        ep_reward = 0
+    def make_env():
+        return DrivingEnv(
+            render_dir=run_dir,
+            view_size=cfg.env.view_size,
+            dt=cfg.env.dt,
+            a_max=cfg.env.a_max,
+            v_max=cfg.env.v_max,
+            w_col=cfg.env.w_col,
+            R_goal=cfg.env.R_goal,
+            disk_radius=cfg.env.disk_radius,
+            video_fps=cfg.env.video_fps,
+            w_dist=cfg.env.w_dist,
+            w_accel=cfg.env.w_accel,
+            max_steps=cfg.train.max_steps,
+            hitwall_cost=cfg.env.hitwall_cost,
+            pyramid_scales=cfg.env.pyramid_scales,
+            num_levels=cfg.env.num_levels,
+            min_start_goal_dist=cfg.env.min_start_goal_dist,
+            max_start_goal_dist=cfg.env.max_start_goal_dist)
+
+    num_rollouts = cfg.train.num_rollouts
+    rollout_steps = cfg.train.rollout_steps
+    episode_num = 1  # For video/logging
+    for rollout_idx in range(1, num_rollouts + 1):
+        rollout_start_time = time.time()
+        print(f"[INFO] Rollout {rollout_idx}: Start recording transitions...")
+        rollout_reward = 0
         buffer.reset()
-        step_count = 0
-        while not buffer.full:
-            with torch.no_grad():
-                dist = actor(obs.unsqueeze(0))
-                action = dist.sample()[0]
-                logprob = dist.log_prob(action).sum()
-                value = critic(obs.unsqueeze(0), action.unsqueeze(0))[0, 0]
-            next_obs, reward, terminated, truncated, info = env.step(
-                action.cpu().numpy())
-            done = terminated or truncated
-            buffer.add(obs, action, reward, float(done), logprob, value)
-            obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
-            ep_reward += reward
-            step_count += 1
-            if done:
-                obs, _ = env.reset(render_video=render_video, episode_num=ep)
-                obs = torch.tensor(obs, dtype=torch.float32, device=device)
+        steps_collected = 0
+        record_start_time = time.time()
+        # --- Video recording for the whole rollout ---
+        video_frames = []
+        video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}.mp4")
+        while steps_collected < rollout_steps:
+            env = make_env()
+            obs, _ = env.reset(render_video=False, episode_num=episode_num)
+            episode_num += 1
+            obs = torch.tensor(obs, dtype=torch.float32, device=device)
+            done = False
+            ep_reward = 0
+            while not done and steps_collected < rollout_steps:
+                with torch.no_grad():
+                    dist = actor(obs.unsqueeze(0))
+                    action = dist.sample()[0]
+                    logprob = dist.log_prob(action).sum()
+                    value = critic(obs.unsqueeze(0), action.unsqueeze(0))[0, 0]
+                next_obs, reward, terminated, truncated, info = env.step(
+                    action.cpu().numpy())
+                # Store reward info for visualization
+                # --- Collect frame for video ---
+                frame = env.get_human_frame(action=action.cpu().numpy(), canvas_size=env.canvas_size, info=info)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                video_frames.append(frame_rgb)
+                # ---
+                done = terminated or truncated
+                buffer.add(obs, action, reward, float(done), logprob, value)
+                obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
+                ep_reward += reward
+                steps_collected += 1
+                if done and steps_collected < rollout_steps:
+                    del env
+                    break
+            rollout_reward += ep_reward
+        # --- Save video for this rollout ---
+        imageio.mimsave(video_path, video_frames, fps=cfg.env.video_fps, codec='libx264')
+        record_time = time.time() - record_start_time
+        update_start_time = time.time()
         # Compute GAE and returns
         obs_buf, act_buf, rew_buf, done_buf, logp_buf, val_buf = buffer.get()
         adv_buf, ret_buf = compute_gae(rew_buf, val_buf, done_buf, gamma, lam)
@@ -723,15 +741,17 @@ def train(cfg: DictConfig):
                 opt_critic.zero_grad()
                 loss_v.backward()
                 opt_critic.step()
-        ep_time = time.time() - ep_start_time
-        print(f"Episode {ep} Reward: {ep_reward:.2f} | Time: {ep_time:.3f} s")
-        writer.add_scalar('Reward/Episode', ep_reward, ep)
-        writer.add_scalar('Time/Episode', ep_time, ep)
-        if ep % cfg.train.save_every == 0:
-            torch.save(actor.state_dict(),
-                       os.path.join(run_dir, f"actor_ep{ep}.pth"))
-            torch.save(critic.state_dict(),
-                       os.path.join(run_dir, f"critic1_ep{ep}.pth"))
+        update_time = time.time() - update_start_time
+        rollout_time = time.time() - rollout_start_time
+        print(f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s.")
+        print(f"[INFO] Rollout {rollout_idx}: TotalReward: {rollout_reward:.2f} | TotalTime: {rollout_time:.3f} s\n")
+        writer.add_scalar('Reward/Rollout', rollout_reward, rollout_idx)
+        writer.add_scalar('Time/Rollout', rollout_time, rollout_idx)
+        writer.add_scalar('Time/Recording', record_time, rollout_idx)
+        writer.add_scalar('Time/Update', update_time, rollout_idx)
+        if rollout_idx % cfg.train.save_every == 0:
+            torch.save(actor.state_dict(), os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))
+            torch.save(critic.state_dict(), os.path.join(run_dir, f"critic1_ep{rollout_idx}.pth"))
     writer.close()
 
 
