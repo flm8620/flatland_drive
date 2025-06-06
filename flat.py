@@ -254,7 +254,7 @@ class DrivingEnv(gym.Env):
         # Set agent to the designated start position from map generation
         self.pos = self.start.astype(np.float32)
         self.vel = np.zeros(2, dtype=np.float32)
-        obs = self._get_obs().cpu().numpy()  # Ensure numpy output
+        obs = self._get_obs()
         self._step_count = 0  # Reset step counter
         self._prev_dist_to_goal = np.linalg.norm(self.pos - self.target)
 
@@ -289,7 +289,7 @@ class DrivingEnv(gym.Env):
         if hit_wall:
             reward = self.hitwall_cost
             terminated = True
-            obs = self._get_obs().cpu().numpy()  # Ensure numpy output
+            obs = self._get_obs()
             info = {
                 'hitwall': reward,
                 'r_progress': 0.0,
@@ -312,7 +312,7 @@ class DrivingEnv(gym.Env):
         self._prev_dist_to_goal = dist_to_goal
         # --- Time penalty ---
         r_time = -0.01  # Small negative reward per step
-        obs = self._get_obs().cpu().numpy()  # Ensure numpy output
+        obs = self._get_obs()
         reward = r_col + r_goal + r_progress + r_time
 
         info = {
@@ -327,14 +327,10 @@ class DrivingEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
-        # Use PyTorch tensors on GPU for BEV observation generation
-        device = 'cuda'
-        # Convert cost_map to tensor (float32, H, W)
-        cost_map = torch.from_numpy(self.cost_map).float().to(device)
         levels = []
         for scale in self.pyramid_scales:
             size = self.view_size
-            crop_size = size * scale
+            crop_size = int(size * scale)
             x, y = self.pos
             half = crop_size // 2
             x0 = int(x) - half
@@ -346,44 +342,37 @@ class DrivingEnv(gym.Env):
             pad_x1, pad_y1 = max(0, x1 - self.map_w), max(0, y1 - self.map_h)
             x0c, x1c = max(0, x0), min(self.map_w, x1)
             y0c, y1c = max(0, y0), min(self.map_h, y1)
-            view = torch.zeros((crop_size, crop_size),
-                               dtype=torch.float32,
-                               device=device)
+            view = np.zeros((crop_size, crop_size), dtype=np.float32)
             view[pad_y0:crop_size - pad_y1,
-                 pad_x0:crop_size - pad_x1] = cost_map[y0c:y1c, x0c:x1c]
+                 pad_x0:crop_size - pad_x1] = self.cost_map[y0c:y1c, x0c:x1c]
             # Set drivable area (cost==0) to -1.0 for visual distinction
-            view = torch.where(view == 0.0, torch.tensor(-1.0, device=device),
-                               view)
+            view[view == 0.0] = -1.0
             # Downsample to view_size
             if scale > 1:
-                view = view.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-                view = torch.nn.functional.interpolate(view,
-                                                       size=(self.view_size,
-                                                             self.view_size),
-                                                       mode='area')
-                view = view[0, 0]
+                view = cv2.resize(view, (self.view_size, self.view_size),
+                                  interpolation=cv2.INTER_AREA)
             # velocity map (two channels: vx and vy, normalized)
-            vx = torch.full_like(view, float(self.vel[0]) / self.v_max)
-            vy = torch.full_like(view, float(self.vel[1]) / self.v_max)
+            vx = np.full_like(view, float(self.vel[0]) / self.v_max)
+            vy = np.full_like(view, float(self.vel[1]) / self.v_max)
             # target map
-            target_map = torch.zeros_like(view)
+            target_map = np.zeros_like(view)
             tx, ty = self.target
             # Compute target position in this crop
             if x0 <= tx < x1 and y0 <= ty < y1:
                 tx_rel = int((tx - x0) / scale)
                 ty_rel = int((ty - y0) / scale)
                 if 0 <= tx_rel < self.view_size and 0 <= ty_rel < self.view_size:
-                    # Draw a filled square (5x5) in tensor for target
+                    # Draw a filled square (5x5) in numpy for target
                     y_start = max(0, ty_rel - 2)
                     y_end = min(self.view_size, ty_rel + 3)
                     x_start = max(0, tx_rel - 2)
                     x_end = min(self.view_size, tx_rel + 3)
                     target_map[y_start:y_end, x_start:x_end] = 1.0
             # Stack: cost, vx, vy, target
-            level = torch.stack([view, vx, vy, target_map], dim=0)  # (4, H, W)
+            level = np.stack([view, vx, vy, target_map], axis=0)  # (4, H, W)
             levels.append(level)
         # Stack pyramid: shape (num_levels, 4, view_size, view_size)
-        obs = torch.stack(levels, dim=0)
+        obs = np.stack(levels, axis=0).astype(np.float32)
         return obs
 
     def obs_level_to_image(self, obs_level, canvas_size=256):
@@ -392,7 +381,6 @@ class DrivingEnv(gym.Env):
         - Cost channel: map to grayscale (min=-1, max=1)
         - Target: overlay in red (strong), and also as a magenta heatmap
         """
-        obs_level = obs_level.detach().cpu().numpy()
         cost = obs_level[0]
         target_map = obs_level[3]  # channel 3 is target
         # Normalize cost: -1 (drivable) -> 0 (black), 1 (non-drivable) -> 255 (white)
@@ -844,8 +832,7 @@ def train(cfg: DictConfig):
             f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s."
         )
         print(
-            f"[INFO] Rollout {rollout_idx}: TotalTime: {rollout_time:.3f} s\n"
-        )
+            f"[INFO] Rollout {rollout_idx}: TotalTime: {rollout_time:.3f} s\n")
         if rollout_idx % cfg.train.save_every == 0:
             torch.save(actor.state_dict(),
                        os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))
