@@ -310,14 +310,17 @@ class DrivingEnv(gym.Env):
         progress = self._prev_dist_to_goal - dist_to_goal
         r_progress = self.w_dist * progress  # per-pixel, not normalized
         self._prev_dist_to_goal = dist_to_goal
+        # --- Time penalty ---
+        r_time = -0.01  # Small negative reward per step
         obs = self._get_obs().cpu().numpy()  # Ensure numpy output
-        reward = r_col + r_goal + r_progress
+        reward = r_col + r_goal + r_progress + r_time
 
         info = {
             'hitwall': 0.0,
             'r_progress': r_progress,
             'r_goal': r_goal,
-            'r_col': r_col
+            'r_col': r_col,
+            'r_time': r_time
         }
 
         self.is_done = terminated or truncated

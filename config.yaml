@@ -10,15 +10,15 @@ env:
   a_max: 2.0
   v_max: 5.0
   w_col: 1.0
-  R_goal: 50.0
+  R_goal: 100.0
   disk_radius: 2.0
   render_dir: ${hydra:run.dir}/viz
   video_fps: 30
-  w_dist: 1.0
+  w_dist: 5.0
   w_accel: 0.1
   save_viz: true
   render_every: 1  # Render every N episodes
-  hitwall_cost: -100.0
+  hitwall_cost: -50.0
   pyramid_scales: [1, 4, 16]
   num_levels: 3
   min_start_goal_dist: 15   # Minimum allowed distance between start and goal
