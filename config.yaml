@@ -4,6 +4,7 @@
 
 # Environment
 env:
+  vector_type: "async" # sync or async
   num_envs: 8
   view_size: 64
   dt: 0.1

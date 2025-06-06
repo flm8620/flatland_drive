@@ -36,7 +36,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from collections import deque
 import random
-from opensimplex import OpenSimplex
 import time
 # Hydra and TensorBoard imports
 from omegaconf import DictConfig, OmegaConf
@@ -45,7 +44,7 @@ from hydra.utils import to_absolute_path
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # Add tqdm import
 import imageio.v2 as imageio
-from gymnasium.vector import SyncVectorEnv
+from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
 
 from networks import ViTEncoder, ConvEncoder
 
@@ -62,6 +61,18 @@ class DrivingEnv(gym.Env):
     Action: discrete (0-8)
     """
     metadata = {'render.modes': []}
+    _accel_table = np.array([
+        (0.0, 0.0),
+        (0.0, 1.0),
+        (1.0 / np.sqrt(2), 1.0 / np.sqrt(2)),
+        (1.0, 0.0),
+        (1.0 / np.sqrt(2), -1.0 / np.sqrt(2)),
+        (0.0, -1.0),
+        (-1.0 / np.sqrt(2), -1.0 / np.sqrt(2)),
+        (-1.0, 0.0),
+        (-1.0 / np.sqrt(2), 1.0 / np.sqrt(2)),
+    ],
+                            dtype=np.float32)
 
     def __init__(self,
                  view_size,
@@ -108,30 +119,11 @@ class DrivingEnv(gym.Env):
                                                    view_size, view_size),
                                             dtype=np.float32)
         self.seed()
-        self.canvas_size = 256  # For human video rendering
         self.max_steps = max_steps
         self._step_count = 0
         self.min_start_goal_dist = min_start_goal_dist
         self.max_start_goal_dist = max_start_goal_dist
         self.is_done = None
-        # Precompute 9 acceleration vectors
-        self._accel_table = self._make_accel_table()
-
-    def _make_accel_table(self):
-        # 0: zero, 1-8: 8 compass directions (N, NE, E, SE, S, SW, W, NW)
-        a = self.a_max
-        dirs = [
-            (0.0, 0.0),  # 0: zero
-            (0.0, a),  # 1: N
-            (a / np.sqrt(2), a / np.sqrt(2)),  # 2: NE
-            (a, 0.0),  # 3: E
-            (a / np.sqrt(2), -a / np.sqrt(2)),  # 4: SE
-            (0.0, -a),  # 5: S
-            (-a / np.sqrt(2), -a / np.sqrt(2)),  # 6: SW
-            (-a, 0.0),  # 7: W
-            (-a / np.sqrt(2), a / np.sqrt(2)),  # 8: NW
-        ]
-        return np.array(dirs, dtype=np.float32)
 
     def seed(self, seed=None):
         if seed is not None:
@@ -264,7 +256,7 @@ class DrivingEnv(gym.Env):
         assert self.is_done is not None
         assert not self.is_done
         # Map discrete action to acceleration vector
-        a = self._accel_table[action]
+        a = DrivingEnv._accel_table[action]
         # Update velocity
         self.vel = self.vel + a * self.dt
         # Limit velocity by norm (ball projection)
@@ -320,7 +312,8 @@ class DrivingEnv(gym.Env):
             'r_progress': r_progress,
             'r_goal': r_goal,
             'r_col': r_col,
-            'r_time': r_time
+            'r_time': r_time,
+            'vel': self.vel.copy(),
         }
 
         self.is_done = terminated or truncated
@@ -375,105 +368,102 @@ class DrivingEnv(gym.Env):
         obs = np.stack(levels, axis=0).astype(np.float32)
         return obs
 
-    def obs_level_to_image(self, obs_level, canvas_size=256):
-        """
-        Convert a single observation level (4, H, W) to a visualization image.
-        - Cost channel: map to grayscale (min=-1, max=1)
-        - Target: overlay in red (strong), and also as a magenta heatmap
-        """
-        cost = obs_level[0]
-        target_map = obs_level[3]  # channel 3 is target
-        # Normalize cost: -1 (drivable) -> 0 (black), 1 (non-drivable) -> 255 (white)
-        cost_norm = (cost + 1) / 2  # -1..1 -> 0..1
-        img = np.stack([cost_norm, cost_norm, cost_norm], axis=-1)  # (H, W, 3)
-        img = (img * 255).astype(np.uint8)
-        # Overlay target as magenta heatmap (blend with cost image)
-        magenta = np.zeros_like(img)
-        magenta[..., 0] = 255  # Red
-        magenta[..., 2] = 255  # Blue
-        alpha = np.clip(target_map, 0, 1)[..., None]  # (H, W, 1)
-        img = img * (1 - alpha) + magenta * alpha
-        img = img.astype(np.uint8)
-        # Upscale
-        img = cv2.resize(img, (canvas_size, canvas_size),
-                         interpolation=cv2.INTER_NEAREST)
-        return img
 
-    def get_human_frame(self, action=None, canvas_size=256, info=None):
-        """
-        Generate a high-res visualization for human viewing.
-        - Uses the current observation as the base image for each level
-        - Draws velocity and action vectors as overlays
-        - Overlays reward info from the provided info dict (if any)
-        """
-        obs = self._get_obs()  # shape: (num_levels, 3, H, W)
-        vis_levels = []
-        for i in range(self.num_levels):
-            img = self.obs_level_to_image(obs[i], canvas_size=canvas_size)
-            # Draw agent (center)
-            cx, cy = canvas_size // 2, canvas_size // 2
-            cv2.circle(
-                img, (cx, cy),
-                max(3, int(self.disk_radius * (canvas_size / self.view_size))),
-                (0, 255, 0), 2)
-            # Draw velocity vector
-            v_norm = np.linalg.norm(self.vel)
-            if v_norm > 1e-3:
-                v_dir = self.vel / (v_norm + 1e-6)
-                v_len = int((v_norm / self.v_max) * (canvas_size // 4))
-                tip = (int(cx + v_dir[0] * v_len), int(cy + v_dir[1] * v_len))
+def obs_level_to_image(obs_level, canvas_size):
+    """
+    Convert a single observation level (4, H, W) to a visualization image.
+    - Cost channel: map to grayscale (min=-1, max=1)
+    - Target: overlay in red (strong), and also as a magenta heatmap
+    """
+    cost = obs_level[0]
+    target_map = obs_level[3]  # channel 3 is target
+    # Normalize cost: -1 (drivable) -> 0 (black), 1 (non-drivable) -> 255 (white)
+    cost_norm = (cost + 1) / 2  # -1..1 -> 0..1
+    img = np.stack([cost_norm, cost_norm, cost_norm], axis=-1)  # (H, W, 3)
+    img = (img * 255).astype(np.uint8)
+    # Overlay target as magenta heatmap (blend with cost image)
+    magenta = np.zeros_like(img)
+    magenta[..., 0] = 255  # Red
+    magenta[..., 2] = 255  # Blue
+    alpha = np.clip(target_map, 0, 1)[..., None]  # (H, W, 1)
+    img = img * (1 - alpha) + magenta * alpha
+    img = img.astype(np.uint8)
+    # Upscale
+    img = cv2.resize(img, (canvas_size, canvas_size),
+                     interpolation=cv2.INTER_NEAREST)
+    return img
+
+
+def get_human_frame(obs, vel, v_max, action=None, info=None, a_max=None):
+    """
+    Generate a high-res visualization for human viewing.
+    - Uses the current observation as the base image for each level
+    - Draws velocity and action vectors as overlays
+    - Overlays reward info from the provided info dict (if any)
+    """
+    vis_levels = []
+    canvas_size = 256
+    num_levels = len(obs)
+    for i in range(num_levels):
+        img = obs_level_to_image(obs[i], canvas_size=canvas_size)
+        # Draw agent (center)
+        cx, cy = canvas_size // 2, canvas_size // 2
+        cv2.circle(img, (cx, cy), 3, (0, 255, 0), 2)
+        # Draw velocity vector
+        v_norm = np.linalg.norm(vel)
+        if v_norm > 1e-3:
+            v_dir = vel / (v_norm + 1e-6)
+            v_len = int((v_norm / v_max) * (canvas_size // 4))
+            tip = (int(cx + v_dir[0] * v_len), int(cy + v_dir[1] * v_len))
+            cv2.arrowedLine(img, (cx, cy),
+                            tip, (255, 255, 0),
+                            2,
+                            tipLength=0.3)
+        # Draw action arrow if provided (discrete action index)
+        if action is not None:
+            # If action is a tensor or numpy scalar, convert to int
+            if hasattr(action, 'item'):
+                action_idx = int(action.item())
+            elif isinstance(action,
+                            (np.ndarray, list)) and np.isscalar(action[0]):
+                action_idx = int(action[0])
+            else:
+                action_idx = int(action)
+            # Get the corresponding acceleration vector
+            a = DrivingEnv._accel_table[action_idx]
+            a_norm = np.linalg.norm(a)
+            if a_norm > 1e-3:
+                a_dir = a / (a_norm + 1e-6)
+                a_len = int((a_norm / a_max) * (canvas_size // 4))
+                tip = (int(cx + a_dir[0] * a_len), int(cy + a_dir[1] * a_len))
                 cv2.arrowedLine(img, (cx, cy),
-                                tip, (255, 255, 0),
+                                tip, (0, 128, 255),
                                 2,
                                 tipLength=0.3)
-            # Draw action arrow if provided (discrete action index)
-            if action is not None:
-                # If action is a tensor or numpy scalar, convert to int
-                if hasattr(action, 'item'):
-                    action_idx = int(action.item())
-                elif isinstance(action,
-                                (np.ndarray, list)) and np.isscalar(action[0]):
-                    action_idx = int(action[0])
-                else:
-                    action_idx = int(action)
-                # Get the corresponding acceleration vector
-                a = self._accel_table[action_idx]
-                a_norm = np.linalg.norm(a)
-                if a_norm > 1e-3:
-                    a_dir = a / (a_norm + 1e-6)
-                    a_len = int((a_norm / self.a_max) * (canvas_size // 4))
-                    tip = (int(cx + a_dir[0] * a_len),
-                           int(cy + a_dir[1] * a_len))
-                    cv2.arrowedLine(img, (cx, cy),
-                                    tip, (0, 128, 255),
-                                    2,
-                                    tipLength=0.3)
-            vis_levels.append(img)
-        frame = np.concatenate(vis_levels, axis=1)
-        # --- Overlay text info ---
-        # Use info dict if provided, else fallback to zeros
-        if info is None:
-            info = {}
-        r_progress = info.get('r_progress', 0.0)
-        r_goal = info.get('r_goal', 0.0)
-        r_col = info.get('r_col', 0.0)
-        hitwall = info.get('hitwall', 0.0)
-        info_lines = [
-            f"r_progress: {r_progress:.2f}",
-            f"r_goal: {r_goal:.2f}",
-            f"r_col: {r_col:.2f}",
-            f"hitwall: {hitwall:.2f}",
-            f"Total reward: {(r_progress + r_goal + r_col + hitwall):.2f}",
-        ]
-        y0 = 30
-        for i, line in enumerate(info_lines):
-            cv2.putText(frame, line, (10, y0 + i * 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
-                        cv2.LINE_AA)
-            cv2.putText(frame, line, (10, y0 + i * 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1,
-                        cv2.LINE_AA)
-        return frame
+        vis_levels.append(img)
+    frame = np.concatenate(vis_levels, axis=1)
+    # --- Overlay text info ---
+    # Use info dict if provided, else fallback to zeros
+    if info is None:
+        info = {}
+    r_progress = info.get('r_progress', 0.0)
+    r_goal = info.get('r_goal', 0.0)
+    r_col = info.get('r_col', 0.0)
+    hitwall = info.get('hitwall', 0.0)
+    info_lines = [
+        f"r_progress: {r_progress:.2f}",
+        f"r_goal: {r_goal:.2f}",
+        f"r_col: {r_col:.2f}",
+        f"hitwall: {hitwall:.2f}",
+        f"Total reward: {(r_progress + r_goal + r_col + hitwall):.2f}",
+    ]
+    y0 = 30
+    for i, line in enumerate(info_lines):
+        cv2.putText(frame, line, (10, y0 + i * 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, line, (10, y0 + i * 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 0, 0), 1, cv2.LINE_AA)
+    return frame
 
 
 ##########################
@@ -674,9 +664,16 @@ def train(cfg: DictConfig):
     clip_eps = getattr(cfg.train, 'clip_eps', 0.2)
 
     num_envs = cfg.env.num_envs
-    # Vectorized env
+    # Vectorized env with switch
+    vector_type = cfg.env.vector_type
+    if vector_type == 'async':
+        VecEnvClass = AsyncVectorEnv
+    elif vector_type == 'sync':
+        VecEnvClass = SyncVectorEnv
+    else:
+        raise ValueError(f"Unknown vector type: {vector_type}")
     env_fns = [make_env(cfg, run_dir) for _ in range(num_envs)]
-    envs = SyncVectorEnv(env_fns)
+    envs = VecEnvClass(env_fns)
     obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
     buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape, device)
 
@@ -724,10 +721,15 @@ def train(cfg: DictConfig):
             info0 = {}
             for key in infos:
                 info0[key] = infos[key][0]
-            frame = envs.envs[0].get_human_frame(
-                action=action[0],
-                canvas_size=envs.envs[0].canvas_size,
-                info=info0)
+
+            env0_vel = infos['vel'][0]
+
+            frame = get_human_frame(obs=cur_obs[0].cpu().numpy(),
+                                    vel=env0_vel,
+                                    v_max=cfg.env.v_max,
+                                    action=action[0],
+                                    info=info0,
+                                    a_max=cfg.env.a_max)
             t_render += time.time() - t0
 
             t0 = time.time()
