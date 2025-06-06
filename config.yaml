@@ -5,7 +5,7 @@
 # Environment
 env:
   vector_type: "async" # sync or async
-  num_envs: 8
+  num_envs: 16
   view_size: 64
   dt: 0.1
   a_max: 2.0
@@ -22,17 +22,17 @@ env:
   hitwall_cost: -50.0
   pyramid_scales: [1, 4, 16]
   num_levels: 3
-  min_start_goal_dist: 15   # Minimum allowed distance between start and goal
-  max_start_goal_dist: 30  # Maximum allowed distance between start and goal
+  min_start_goal_dist: 20   # Minimum allowed distance between start and goal
+  max_start_goal_dist: 150  # Maximum allowed distance between start and goal
 
 # Training
 train:
-  lr: 0.001
+  lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95
   rollout_steps: 2048
   ppo_epochs: 4
-  minibatch_size: 128
+  minibatch_size: 64
   clip_eps: 0.2
   episodes: 500
   max_steps: 2000
