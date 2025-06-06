@@ -716,6 +716,9 @@ def train(cfg: DictConfig):
                         fps=cfg.env.video_fps,
                         codec='libx264')
         record_time = time.time() - record_start_time
+        print(
+            f"[INFO] Rollout {rollout_idx}: Record took {record_time:.3f} s."
+        )
         update_start_time = time.time()
         # Compute GAE and returns
         obs_buf, act_buf, rew_buf, terminal_buf, logp_buf, val_buf = buffer.get(
@@ -745,7 +748,7 @@ def train(cfg: DictConfig):
                 loss_pi.backward()
                 opt_actor.step()
                 # Critic update
-                value = critic(mb_obs, mb_act).squeeze(-1)
+                value = critic(mb_obs).squeeze(-1)
                 loss_v = F.mse_loss(value, mb_ret)
                 opt_critic.zero_grad()
                 loss_v.backward()
@@ -759,9 +762,6 @@ def train(cfg: DictConfig):
             f"[INFO] Rollout {rollout_idx}: TotalReward: {rollout_reward:.2f} | TotalTime: {rollout_time:.3f} s\n"
         )
         writer.add_scalar('Reward/Rollout', rollout_reward, rollout_idx)
-        writer.add_scalar('Time/Rollout', rollout_time, rollout_idx)
-        writer.add_scalar('Time/Recording', record_time, rollout_idx)
-        writer.add_scalar('Time/Update', update_time, rollout_idx)
         if rollout_idx % cfg.train.save_every == 0:
             torch.save(actor.state_dict(),
                        os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))
