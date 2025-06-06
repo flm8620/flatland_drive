@@ -403,9 +403,6 @@ class DrivingEnv(gym.Env):
         alpha = np.clip(target_map, 0, 1)[..., None]  # (H, W, 1)
         img = img * (1 - alpha) + magenta * alpha
         img = img.astype(np.uint8)
-        # Overlay target (where target_map > 0.5) in strong red
-        target_mask = target_map > 0.5
-        img[target_mask] = [0, 0, 255]
         # Upscale
         img = cv2.resize(img, (canvas_size, canvas_size),
                          interpolation=cv2.INTER_NEAREST)
@@ -438,17 +435,22 @@ class DrivingEnv(gym.Env):
                                 tip, (255, 255, 0),
                                 2,
                                 tipLength=0.3)
-            # Draw action vector if provided
+            # Draw action arrow if provided (discrete action index)
             if action is not None:
-                # assert action is not NaN nor Inf
-                if not np.isfinite(action).all():
-                    raise ValueError("Action contains NaN or Inf values.")
-                a_norm = np.linalg.norm(action)
+                # If action is a tensor or numpy scalar, convert to int
+                if hasattr(action, 'item'):
+                    action_idx = int(action.item())
+                elif isinstance(action, (np.ndarray, list)) and np.isscalar(action[0]):
+                    action_idx = int(action[0])
+                else:
+                    action_idx = int(action)
+                # Get the corresponding acceleration vector
+                a = self._accel_table[action_idx]
+                a_norm = np.linalg.norm(a)
                 if a_norm > 1e-3:
-                    a_dir = action / (a_norm + 1e-6)
+                    a_dir = a / (a_norm + 1e-6)
                     a_len = int((a_norm / self.a_max) * (canvas_size // 4))
-                    tip = (int(cx + a_dir[0] * a_len),
-                           int(cy + a_dir[1] * a_len))
+                    tip = (int(cx + a_dir[0] * a_len), int(cy + a_dir[1] * a_len))
                     cv2.arrowedLine(img, (cx, cy),
                                     tip, (0, 128, 255),
                                     2,
@@ -663,14 +665,17 @@ def train(cfg: DictConfig):
         episode_num += 1
         is_next_terminal = False
 
-        # --- Timing accumulators ---
+        # --- Discounted reward tracking ---
+        episode_rewards = []  # List of discounted rewards for complete episodes
+        cur_episode_rewards = []
+        gamma_pow = 1.0
+        gamma = cfg.train.gamma
         t_infer = 0.0
         t_env = 0.0
         t_render = 0.0
         t_cv = 0.0
         t_buffer = 0.0
         t_append = 0.0
-
         for _ in range(rollout_steps):
             cur_obs = next_obs
             is_current_terminal = is_next_terminal
@@ -684,6 +689,11 @@ def train(cfg: DictConfig):
 
             t0 = time.time()
             if is_current_terminal:
+                # If previous episode ended, check if it was not truncated and log reward
+                if len(cur_episode_rewards) > 0:
+                    episode_rewards.append(sum(cur_episode_rewards))
+                cur_episode_rewards = []
+                gamma_pow = 1.0
                 next_obs, _ = env.reset(episode_num=episode_num)
                 episode_num += 1
                 reward = 0.0
@@ -693,9 +703,6 @@ def train(cfg: DictConfig):
             else:
                 next_obs, reward, terminated, truncated, info = env.step(
                     int(action.cpu().item()))
-                next_obs = torch.tensor(next_obs,
-                                        dtype=torch.float32,
-                                        device=device)
             t_env += time.time() - t0
 
             t0 = time.time()
@@ -720,7 +727,10 @@ def train(cfg: DictConfig):
             is_next_terminal = terminated or truncated
 
             rollout_reward += reward
-        
+            # --- Discounted reward accumulation ---
+            cur_episode_rewards.append(reward * gamma_pow)
+            gamma_pow *= gamma
+
         with torch.no_grad():
             next_value = critic(next_obs.unsqueeze(0))[0, 0]
 
@@ -741,6 +751,8 @@ def train(cfg: DictConfig):
         adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
         # PPO update
         inds = torch.randperm(rollout_steps)
+        actor_losses = []
+        critic_losses = []
         for _ in range(ppo_epochs):
             for start in range(0, rollout_steps, minibatch_size):
                 mb_inds = inds[start:start + minibatch_size]
@@ -760,17 +772,25 @@ def train(cfg: DictConfig):
                 opt_actor.zero_grad()
                 loss_pi.backward()
                 opt_actor.step()
+                actor_losses.append(loss_pi.item())
                 # Critic update
                 value = critic(mb_obs).squeeze(-1)
                 loss_v = F.mse_loss(value, mb_ret)
                 opt_critic.zero_grad()
                 loss_v.backward()
                 opt_critic.step()
+                critic_losses.append(loss_v.item())
+        # Log losses
+        writer.add_scalar('Loss/Actor', np.mean(actor_losses), rollout_idx)
+        writer.add_scalar('Loss/Critic', np.mean(critic_losses), rollout_idx)
+        # Log average discounted episode reward (only for complete episodes)
+        if episode_rewards:
+            avg_discounted_reward = np.mean(episode_rewards)
+            writer.add_scalar('Reward/AvgDiscountedEpisode', avg_discounted_reward, rollout_idx)
         update_time = time.time() - update_start_time
         rollout_time = time.time() - rollout_start_time
         print(
-            f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s."
-        )
+            f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s.")
         print(
             f"[INFO] Rollout {rollout_idx}: TotalReward: {rollout_reward:.2f} | TotalTime: {rollout_time:.3f} s\n"
         )
