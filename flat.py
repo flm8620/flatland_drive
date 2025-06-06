@@ -694,7 +694,6 @@ def train(cfg: DictConfig):
     for rollout_idx in range(1, num_rollouts + 1):
         rollout_start_time = time.time()
         print(f"[INFO] Rollout {rollout_idx}: Start recording transitions...")
-        rollout_reward = 0
         buffer.reset()
         record_start_time = time.time()
         # --- Video recording for the whole rollout ---
@@ -731,12 +730,6 @@ def train(cfg: DictConfig):
 
             t0 = time.time()
             # Only record video for the first env
-            # info0 = {
-            #     'hitwall': infos.get('hitwall', [0])[0],
-            #     'r_progress': infos.get('r_progress', [0])[0],
-            #     'r_goal': infos.get('r_goal', [0])[0],
-            #     'r_col': infos.get('r_col', [0])[0]
-            # }
             info0 = {}
             for key in infos:
                 info0[key] = infos[key][0]
@@ -763,8 +756,10 @@ def train(cfg: DictConfig):
 
             is_next_terminal = np.logical_or(terminated, truncated)
             for i in range(num_envs):
-                cur_episode_rewards[i].append(reward[i] * gamma_pow[i])
-                gamma_pow[i] *= gamma
+                # Only update if current step is not a placeholder (not terminal)
+                if not is_current_terminal[i]:
+                    cur_episode_rewards[i].append(reward[i] * gamma_pow[i])
+                    gamma_pow[i] *= gamma
                 if is_next_terminal[i]:
                     if len(cur_episode_rewards[i]) > 0:
                         episode_rewards[i].append(sum(cur_episode_rewards[i]))
@@ -846,9 +841,8 @@ def train(cfg: DictConfig):
             f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s."
         )
         print(
-            f"[INFO] Rollout {rollout_idx}: TotalReward: {rollout_reward:.2f} | TotalTime: {rollout_time:.3f} s\n"
+            f"[INFO] Rollout {rollout_idx}: TotalTime: {rollout_time:.3f} s\n"
         )
-        writer.add_scalar('Reward/Rollout', rollout_reward, rollout_idx)
         if rollout_idx % cfg.train.save_every == 0:
             torch.save(actor.state_dict(),
                        os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))
