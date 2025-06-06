@@ -55,12 +55,11 @@ from networks import ViTEncoder, ConvEncoder
 class DrivingEnv(gym.Env):
     """
     2D disk driving env:
-    - Continuous acceleration control
+    - Discrete acceleration control (9 choices: zero or 8 compass directions)
     - Cost map penalty + collision + goal reward
     Observation: BEV image + velocity (2-d)
-    Action: acceleration vector (2-d)
+    Action: discrete (0-8)
     """
-    # metadata = {'render.modes': ['human']}
     metadata = {'render.modes': []}
 
     def __init__(self,
@@ -98,10 +97,8 @@ class DrivingEnv(gym.Env):
         self.video_writer = None
         if self.render_dir:
             os.makedirs(self.render_dir, exist_ok=True)
-        self.action_space = spaces.Box(low=-a_max,
-                                       high=a_max,
-                                       shape=(2, ),
-                                       dtype=np.float32)
+        # Discrete action space: 9 actions
+        self.action_space = spaces.Discrete(9)
         self.pyramid_scales = list(pyramid_scales)
         self.num_levels = num_levels
         self.observation_space = spaces.Box(low=-1.0,
@@ -116,6 +113,24 @@ class DrivingEnv(gym.Env):
         self.min_start_goal_dist = min_start_goal_dist
         self.max_start_goal_dist = max_start_goal_dist
         self.is_done = None
+        # Precompute 9 acceleration vectors
+        self._accel_table = self._make_accel_table()
+
+    def _make_accel_table(self):
+        # 0: zero, 1-8: 8 compass directions (N, NE, E, SE, S, SW, W, NW)
+        a = self.a_max
+        dirs = [
+            (0.0, 0.0),  # 0: zero
+            (0.0, a),    # 1: N
+            (a/np.sqrt(2), a/np.sqrt(2)),  # 2: NE
+            (a, 0.0),    # 3: E
+            (a/np.sqrt(2), -a/np.sqrt(2)), # 4: SE
+            (0.0, -a),   # 5: S
+            (-a/np.sqrt(2), -a/np.sqrt(2)),# 6: SW
+            (-a, 0.0),   # 7: W
+            (-a/np.sqrt(2), a/np.sqrt(2)), # 8: NW
+        ]
+        return np.array(dirs, dtype=np.float32)
 
     def seed(self, seed=None):
         if seed is not None:
@@ -253,11 +268,8 @@ class DrivingEnv(gym.Env):
     def step(self, action):
         assert self.is_done is not None
         assert not self.is_done
-        # Limit acceleration by norm (ball projection)
-        a = np.array(action)
-        a_norm = np.linalg.norm(a)
-        if a_norm > self.a_max:
-            a = a * (self.a_max / a_norm)
+        # Map discrete action to acceleration vector
+        a = self._accel_table[action]
         # Update velocity
         self.vel = self.vel + a * self.dt
         # Limit velocity by norm (ball projection)
@@ -285,7 +297,6 @@ class DrivingEnv(gym.Env):
             obs = self._get_obs()
             info = {
                 'hitwall': reward,
-                'r_accel': 0.0,
                 'r_progress': 0.0,
                 'r_goal': 0.0,
                 'r_col': 0.0
@@ -304,17 +315,13 @@ class DrivingEnv(gym.Env):
         progress = self._prev_dist_to_goal - dist_to_goal
         r_progress = self.w_dist * progress  # per-pixel, not normalized
         self._prev_dist_to_goal = dist_to_goal
-        # Acceleration penalty (normalized)
-        a_norm = np.linalg.norm(action)
-        excess = max(0, a_norm - self.a_max)
-        r_accel = -self.w_accel * (excess / self.a_max)
+        # Acceleration penalty removed (no longer needed)
 
         obs = self._get_obs()
-        reward = r_col + r_goal + r_progress + r_accel
+        reward = r_col + r_goal + r_progress
 
         info = {
             'hitwall': 0.0,
-            'r_accel': r_accel,
             'r_progress': r_progress,
             'r_goal': r_goal,
             'r_col': r_col
@@ -452,18 +459,16 @@ class DrivingEnv(gym.Env):
         # Use info dict if provided, else fallback to zeros
         if info is None:
             info = {}
-        r_accel = info.get('r_accel', 0.0)
         r_progress = info.get('r_progress', 0.0)
         r_goal = info.get('r_goal', 0.0)
         r_col = info.get('r_col', 0.0)
         hitwall = info.get('hitwall', 0.0)
         info_lines = [
             f"r_progress: {r_progress:.2f}",
-            f"r_accel: {r_accel:.2f}",
             f"r_goal: {r_goal:.2f}",
             f"r_col: {r_col:.2f}",
             f"hitwall: {hitwall:.2f}",
-            f"Total reward: {(r_accel + r_progress + r_goal + r_col + hitwall):.2f}",
+            f"Total reward: {(r_progress + r_goal + r_col + hitwall):.2f}",
         ]
         y0 = 30
         for i, line in enumerate(info_lines):
@@ -497,7 +502,7 @@ def make_encoder(cfg, view_size, num_levels):
 
 class Actor(nn.Module):
 
-    def __init__(self, cfg, view_size, action_dim=2, num_levels=3):
+    def __init__(self, cfg, view_size, action_dim=9, num_levels=3):
         super().__init__()
         self.encoder = make_encoder(cfg, view_size, num_levels)
         hidden_dim = self.encoder.fc_out.out_features if hasattr(
@@ -508,21 +513,13 @@ class Actor(nn.Module):
             nn.Linear(128, 128),
             nn.ReLU(),
         )
-        self.mu_head = nn.Linear(128, action_dim)
-        self.log_std_head = nn.Linear(128, action_dim)
-        self.LOG_STD_MIN = -5
-        self.LOG_STD_MAX = 2
+        self.logits_head = nn.Linear(128, action_dim)
 
     def forward(self, obs):
         h = self.encoder(obs)
         x = self.net(h)
-        mu = self.mu_head(x)
-        log_std = self.log_std_head(x)
-        log_std = torch.tanh(log_std)
-        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX -
-                                            self.LOG_STD_MIN) * (log_std + 1)
-        std = log_std.exp()
-        dist = torch.distributions.Normal(mu, std)
+        logits = self.logits_head(x)
+        dist = torch.distributions.Categorical(logits=logits)
         return dist
 
 
@@ -546,7 +543,7 @@ class Critic(nn.Module):
 ##########################
 class RolloutBuffer:
 
-    def __init__(self, size, obs_shape, action_dim, device):
+    def __init__(self, size, obs_shape, device):
         self.size = size
         self.device = device
         self.ptr = 0
@@ -554,9 +551,7 @@ class RolloutBuffer:
         self.obs = torch.zeros((size, *obs_shape),
                                dtype=torch.float32,
                                device=device)
-        self.actions = torch.zeros((size, action_dim),
-                                   dtype=torch.float32,
-                                   device=device)
+        self.actions = torch.zeros(size, dtype=torch.long, device=device)
         self.rewards = torch.zeros(size, dtype=torch.float32, device=device)
         self.is_terminals = torch.zeros(size,
                                         dtype=torch.float32,
@@ -632,8 +627,7 @@ def train(cfg: DictConfig):
     clip_eps = getattr(cfg.train, 'clip_eps', 0.2)
 
     obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
-    action_dim = 2
-    buffer = RolloutBuffer(rollout_steps, obs_shape, action_dim, device)
+    buffer = RolloutBuffer(rollout_steps, obs_shape, device)
 
     env = DrivingEnv(render_dir=run_dir,
                      view_size=cfg.env.view_size,
@@ -684,7 +678,7 @@ def train(cfg: DictConfig):
             with torch.no_grad():
                 dist = actor(cur_obs.unsqueeze(0))
                 action = dist.sample()[0]
-                logprob = dist.log_prob(action).sum()
+                logprob = dist.log_prob(action)
                 value = critic(cur_obs.unsqueeze(0))[0, 0]
             t_infer += time.time() - t0
 
@@ -698,7 +692,7 @@ def train(cfg: DictConfig):
                 info = None
             else:
                 next_obs, reward, terminated, truncated, info = env.step(
-                    action.cpu().numpy())
+                    int(action.cpu().item()))
                 next_obs = torch.tensor(next_obs,
                                         dtype=torch.float32,
                                         device=device)
@@ -741,8 +735,7 @@ def train(cfg: DictConfig):
         print(f"[TIMER] Rollout {rollout_idx}: infer={t_infer:.3f}s, env={t_env:.3f}s, render={t_render:.3f}s, cvtColor={t_cv:.3f}s, buffer={t_buffer:.3f}s, append={t_append:.3f}s")
         update_start_time = time.time()
         # Compute GAE and returns
-        obs_buf, act_buf, rew_buf, terminal_buf, logp_buf, val_buf = buffer.get(
-        )
+        obs_buf, act_buf, rew_buf, terminal_buf, logp_buf, val_buf = buffer.get()
         adv_buf, ret_buf = compute_gae(rew_buf, val_buf, terminal_buf, gamma,
                                        lam, next_value, is_next_terminal)
         adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
@@ -758,7 +751,7 @@ def train(cfg: DictConfig):
                 mb_logp_old = logp_buf[mb_inds]
                 # Actor update
                 dist = actor(mb_obs)
-                logp = dist.log_prob(mb_act).sum(-1)
+                logp = dist.log_prob(mb_act)
                 ratio = (logp - mb_logp_old).exp()
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - clip_eps,
