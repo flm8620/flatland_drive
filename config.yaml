@@ -18,7 +18,7 @@ env:
   w_dist: 5.0
   w_accel: 0.1
   save_viz: true
-  render_every: 1  # Render every N episodes
+  render_every: 5  # Render every N episodes
   hitwall_cost: -50.0
   pyramid_scales: [1, 4, 16]
   num_levels: 3

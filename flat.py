@@ -685,7 +685,8 @@ def train(cfg: DictConfig):
         buffer.reset()
         record_start_time = time.time()
         # --- Video recording for the whole rollout ---
-        video_frames = []
+        render_this_rollout = (cfg.env.render_every > 0 and rollout_idx % cfg.env.render_every == 0)
+        video_frames = [] if render_this_rollout else None
         video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}.mp4")
         next_obs, _ = envs.reset()
         next_obs = torch.as_tensor(next_obs,
@@ -716,29 +717,30 @@ def train(cfg: DictConfig):
                                        dtype=torch.float32)
             t_env += time.time() - t0
 
-            t0 = time.time()
-            # Only record video for the first env
-            info0 = {}
-            for key in infos:
-                info0[key] = infos[key][0]
+            if render_this_rollout:
+                t0 = time.time()
+                # Only record video for the first env
+                info0 = {}
+                for key in infos:
+                    info0[key] = infos[key][0]
 
-            env0_vel = infos['vel'][0]
+                env0_vel = infos['vel'][0]
 
-            frame = get_human_frame(obs=cur_obs[0].cpu().numpy(),
-                                    vel=env0_vel,
-                                    v_max=cfg.env.v_max,
-                                    action=action[0],
-                                    info=info0,
-                                    a_max=cfg.env.a_max)
-            t_render += time.time() - t0
+                frame = get_human_frame(obs=cur_obs[0].cpu().numpy(),
+                                        vel=env0_vel,
+                                        v_max=cfg.env.v_max,
+                                        action=action[0],
+                                        info=info0,
+                                        a_max=cfg.env.a_max)
+                t_render += time.time() - t0
 
-            t0 = time.time()
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            t_cv += time.time() - t0
+                t0 = time.time()
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                t_cv += time.time() - t0
 
-            t0 = time.time()
-            video_frames.append(frame_rgb)
-            t_append += time.time() - t0
+                t0 = time.time()
+                video_frames.append(frame_rgb)
+                t_append += time.time() - t0
 
             t0 = time.time()
             # Add batched data to buffer
@@ -761,10 +763,11 @@ def train(cfg: DictConfig):
         with torch.no_grad():
             next_value = critic(next_obs).squeeze(-1)
         # --- Save video for this rollout ---
-        imageio.mimsave(video_path,
-                        video_frames,
-                        fps=cfg.env.video_fps,
-                        codec='libx264')
+        if render_this_rollout and video_frames:
+            imageio.mimsave(video_path,
+                            video_frames,
+                            fps=cfg.env.video_fps,
+                            codec='libx264')
         record_time = time.time() - record_start_time
         print(
             f"[INFO] Rollout {rollout_idx}: Record took {record_time:.3f} s.")
