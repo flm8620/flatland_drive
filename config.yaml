@@ -4,6 +4,7 @@
 
 # Environment
 env:
+  num_envs: 4
   view_size: 64
   dt: 0.1
   a_max: 2.0
