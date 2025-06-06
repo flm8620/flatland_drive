@@ -324,12 +324,13 @@ class DrivingEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
-        # Pyramid levels: (scale, view_size)
-        pyramid_scales = self.pyramid_scales  # Use instance variable from config
+        # Use PyTorch tensors on GPU for BEV observation generation
+        device = 'cuda'
+        # Convert cost_map to tensor (float32, H, W)
+        cost_map = torch.from_numpy(self.cost_map).float().to(device)
         levels = []
-        for scale in pyramid_scales:
+        for scale in self.pyramid_scales:
             size = self.view_size
-            # Compute crop size in map pixels
             crop_size = size * scale
             x, y = self.pos
             half = crop_size // 2
@@ -337,40 +338,43 @@ class DrivingEnv(gym.Env):
             x1 = x0 + crop_size
             y0 = int(y) - half
             y1 = y0 + crop_size
-            # pad
+            # Pad if out of bounds
             pad_x0, pad_y0 = max(0, -x0), max(0, -y0)
             pad_x1, pad_y1 = max(0, x1 - self.map_w), max(0, y1 - self.map_h)
             x0c, x1c = max(0, x0), min(self.map_w, x1)
             y0c, y1c = max(0, y0), min(self.map_h, y1)
-            view = np.zeros((crop_size, crop_size), dtype=np.float32)
-            view[pad_y0:crop_size-pad_y1, pad_x0:crop_size-pad_x1] = \
-                self.cost_map[y0c:y1c, x0c:x1c]
+            view = torch.zeros((crop_size, crop_size), dtype=torch.float32, device=device)
+            view[pad_y0:crop_size-pad_y1, pad_x0:crop_size-pad_x1] = cost_map[y0c:y1c, x0c:x1c]
             # Set drivable area (cost==0) to -1.0 for visual distinction
-            view[view == 0.0] = -1.0
+            view = torch.where(view == 0.0, torch.tensor(-1.0, device=device), view)
             # Downsample to view_size
             if scale > 1:
-                view = cv2.resize(view, (self.view_size, self.view_size),
-                                  interpolation=cv2.INTER_AREA)
-
-            # velocity map (now two channels: vx and vy, normalized)
-            vx = np.full_like(view, self.vel[0] / self.v_max)
-            vy = np.full_like(view, self.vel[1] / self.v_max)
+                view = view.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+                view = torch.nn.functional.interpolate(view, size=(self.view_size, self.view_size), mode='area')
+                view = view[0,0]
+            # velocity map (two channels: vx and vy, normalized)
+            vx = torch.full_like(view, float(self.vel[0]) / self.v_max)
+            vy = torch.full_like(view, float(self.vel[1]) / self.v_max)
             # target map
-            target_map = np.zeros_like(view)
+            target_map = torch.zeros_like(view)
             tx, ty = self.target
             # Compute target position in this crop
             if x0 <= tx < x1 and y0 <= ty < y1:
                 tx_rel = int((tx - x0) / scale)
                 ty_rel = int((ty - y0) / scale)
                 if 0 <= tx_rel < self.view_size and 0 <= ty_rel < self.view_size:
-                    cv2.circle(target_map, (tx_rel, ty_rel),
-                               color=1.0,
-                               radius=2,
-                               thickness=-1)
+                    # Draw a filled square (5x5) in tensor for target
+                    y_start = max(0, ty_rel - 2)
+                    y_end = min(self.view_size, ty_rel + 3)
+                    x_start = max(0, tx_rel - 2)
+                    x_end = min(self.view_size, tx_rel + 3)
+                    target_map[y_start:y_end, x_start:x_end] = 1.0
             # Stack: cost, vx, vy, target
-            levels.append(np.stack([view, vx, vy, target_map], axis=0))
+            level = torch.stack([view, vx, vy, target_map], dim=0)  # (4, H, W)
+            levels.append(level)
         # Stack pyramid: shape (num_levels, 4, view_size, view_size)
-        return np.stack(levels, axis=0)
+        obs = torch.stack(levels, dim=0)
+        return obs
 
     def obs_level_to_image(self, obs_level, canvas_size=256):
         """
@@ -378,6 +382,7 @@ class DrivingEnv(gym.Env):
         - Cost channel: map to grayscale (min=-1, max=1)
         - Target: overlay in red (strong), and also as a magenta heatmap
         """
+        obs_level = obs_level.detach().cpu().numpy()
         cost = obs_level[0]
         target_map = obs_level[3]  # channel 3 is target
         # Normalize cost: -1 (drivable) -> 0 (black), 1 (non-drivable) -> 255 (white)
@@ -661,25 +666,32 @@ def train(cfg: DictConfig):
         video_frames = []
         video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}.mp4")
         next_obs, _ = env.reset(episode_num=episode_num)
-        next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
         episode_num += 1
         is_next_terminal = False
+
+        # --- Timing accumulators ---
+        t_infer = 0.0
+        t_env = 0.0
+        t_render = 0.0
+        t_cv = 0.0
+        t_buffer = 0.0
+        t_append = 0.0
 
         for _ in range(rollout_steps):
             cur_obs = next_obs
             is_current_terminal = is_next_terminal
+            t0 = time.time()
             with torch.no_grad():
                 dist = actor(cur_obs.unsqueeze(0))
                 action = dist.sample()[0]
                 logprob = dist.log_prob(action).sum()
                 value = critic(cur_obs.unsqueeze(0))[0, 0]
+            t_infer += time.time() - t0
 
+            t0 = time.time()
             if is_current_terminal:
                 next_obs, _ = env.reset(episode_num=episode_num)
                 episode_num += 1
-                next_obs = torch.tensor(next_obs,
-                                        dtype=torch.float32,
-                                        device=device)
                 reward = 0.0
                 terminated = False
                 truncated = False
@@ -690,18 +702,26 @@ def train(cfg: DictConfig):
                 next_obs = torch.tensor(next_obs,
                                         dtype=torch.float32,
                                         device=device)
+            t_env += time.time() - t0
 
-            # Store reward info for visualization
-            # --- Collect frame for video ---
+            t0 = time.time()
             frame = env.get_human_frame(action=action.cpu().numpy(),
                                         canvas_size=env.canvas_size,
                                         info=info)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            video_frames.append(frame_rgb)
-            # ---
+            t_render += time.time() - t0
 
+            t0 = time.time()
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            t_cv += time.time() - t0
+
+            t0 = time.time()
+            video_frames.append(frame_rgb)
+            t_append += time.time() - t0
+
+            t0 = time.time()
             buffer.add(cur_obs, action, reward, float(is_current_terminal),
                        logprob, value)
+            t_buffer += time.time() - t0
 
             is_next_terminal = terminated or truncated
 
@@ -717,8 +737,8 @@ def train(cfg: DictConfig):
                         codec='libx264')
         record_time = time.time() - record_start_time
         print(
-            f"[INFO] Rollout {rollout_idx}: Record took {record_time:.3f} s."
-        )
+            f"[INFO] Rollout {rollout_idx}: Record took {record_time:.3f} s.")
+        print(f"[TIMER] Rollout {rollout_idx}: infer={t_infer:.3f}s, env={t_env:.3f}s, render={t_render:.3f}s, cvtColor={t_cv:.3f}s, buffer={t_buffer:.3f}s, append={t_append:.3f}s")
         update_start_time = time.time()
         # Compute GAE and returns
         obs_buf, act_buf, rew_buf, terminal_buf, logp_buf, val_buf = buffer.get(
