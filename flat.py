@@ -650,11 +650,10 @@ def train(cfg: DictConfig):
     start_rollout_idx = 1
     if cfg.train.resume:
         import glob
-        # Determine which directory to resume from
-        resume_dir = getattr(cfg, 'resume_dir', None) or run_dir
         # Find latest actor and critic files
-        actor_files = sorted(glob.glob(os.path.join(resume_dir, 'actor_ep*.pth')))
-        critic_files = sorted(glob.glob(os.path.join(resume_dir, 'critic1_ep*.pth')))
+        actor_files = sorted(glob.glob(os.path.join(run_dir, 'actor_ep*.pth')))
+        critic_files = sorted(
+            glob.glob(os.path.join(run_dir, 'critic1_ep*.pth')))
         if actor_files and critic_files:
             # Get the highest episode number (use only the filename part)
             def extract_ep(fname):
@@ -662,15 +661,22 @@ def train(cfg: DictConfig):
                 base = os.path.basename(fname)
                 m = re.search(r'ep(\d+)', base)
                 return int(m.group(1)) if m else -1
+
             latest_actor = max(actor_files, key=extract_ep)
             latest_critic = max(critic_files, key=extract_ep)
             latest_ep = extract_ep(latest_actor)
-            print(f"[RESUME] Loading actor from {latest_actor}, critic from {latest_critic}, starting at rollout {latest_ep+1}")
-            actor.load_state_dict(torch.load(latest_actor, map_location=device))
-            critic.load_state_dict(torch.load(latest_critic, map_location=device))
+            print(
+                f"[RESUME] Loading actor from {latest_actor}, critic from {latest_critic}, starting at rollout {latest_ep+1}"
+            )
+            actor.load_state_dict(torch.load(latest_actor,
+                                             map_location=device))
+            critic.load_state_dict(
+                torch.load(latest_critic, map_location=device))
             start_rollout_idx = latest_ep + 1
         else:
-            print(f"[RESUME] No checkpoint found in {resume_dir}, starting from scratch.")
+            print(
+                f"[RESUME] No checkpoint found in {run_dir}, starting from scratch."
+            )
 
     # === Load from snapshot if specified ===
     if cfg.load_actor_path:
@@ -683,11 +689,11 @@ def train(cfg: DictConfig):
         critic.load_state_dict(torch.load(critic_path, map_location=device))
 
     gamma = cfg.train.gamma
-    lam = getattr(cfg.train, 'gae_lambda', 0.95)
+    lam = cfg.train.gae_lambda
     rollout_steps = cfg.train.rollout_steps
-    ppo_epochs = getattr(cfg.train, 'ppo_epochs', 4)
-    minibatch_size = getattr(cfg.train, 'minibatch_size', 64)
-    clip_eps = getattr(cfg.train, 'clip_eps', 0.2)
+    ppo_epochs = cfg.train.ppo_epochs
+    minibatch_size = cfg.train.minibatch_size
+    clip_eps = cfg.train.clip_eps
 
     num_envs = cfg.env.num_envs
     # Vectorized env with switch
@@ -711,7 +717,8 @@ def train(cfg: DictConfig):
         buffer.reset()
         record_start_time = time.time()
         # --- Video recording for the whole rollout ---
-        render_this_rollout = (cfg.env.render_every > 0 and rollout_idx % cfg.env.render_every == 0)
+        render_this_rollout = (cfg.env.render_every > 0
+                               and rollout_idx % cfg.env.render_every == 0)
         video_frames = [] if render_this_rollout else None
         video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}.mp4")
         next_obs, _ = envs.reset()
