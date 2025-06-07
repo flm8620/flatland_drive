@@ -27,6 +27,7 @@ env:
 
 # Training
 train:
+  resume: true
   lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95

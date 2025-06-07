@@ -646,6 +646,32 @@ def train(cfg: DictConfig):
     opt_actor = optim.Adam(actor.parameters(), lr=cfg.train.lr)
     opt_critic = optim.Adam(critic.parameters(), lr=cfg.train.lr)
 
+    # === Resume logic ===
+    start_rollout_idx = 1
+    if cfg.train.resume:
+        import glob
+        # Determine which directory to resume from
+        resume_dir = getattr(cfg, 'resume_dir', None) or run_dir
+        # Find latest actor and critic files
+        actor_files = sorted(glob.glob(os.path.join(resume_dir, 'actor_ep*.pth')))
+        critic_files = sorted(glob.glob(os.path.join(resume_dir, 'critic1_ep*.pth')))
+        if actor_files and critic_files:
+            # Get the highest episode number (use only the filename part)
+            def extract_ep(fname):
+                import re, os
+                base = os.path.basename(fname)
+                m = re.search(r'ep(\d+)', base)
+                return int(m.group(1)) if m else -1
+            latest_actor = max(actor_files, key=extract_ep)
+            latest_critic = max(critic_files, key=extract_ep)
+            latest_ep = extract_ep(latest_actor)
+            print(f"[RESUME] Loading actor from {latest_actor}, critic from {latest_critic}, starting at rollout {latest_ep+1}")
+            actor.load_state_dict(torch.load(latest_actor, map_location=device))
+            critic.load_state_dict(torch.load(latest_critic, map_location=device))
+            start_rollout_idx = latest_ep + 1
+        else:
+            print(f"[RESUME] No checkpoint found in {resume_dir}, starting from scratch.")
+
     # === Load from snapshot if specified ===
     if cfg.load_actor_path:
         actor_path = cfg.load_actor_path
@@ -679,7 +705,7 @@ def train(cfg: DictConfig):
 
     num_rollouts = cfg.train.num_rollouts
     rollout_steps = cfg.train.rollout_steps
-    for rollout_idx in range(1, num_rollouts + 1):
+    for rollout_idx in range(start_rollout_idx, num_rollouts + 1):
         rollout_start_time = time.time()
         print(f"[INFO] Rollout {rollout_idx}: Start recording transitions...")
         buffer.reset()
