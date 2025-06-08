@@ -45,6 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # Add tqdm import
 import imageio.v2 as imageio
 from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
+from torch.amp import autocast, GradScaler
 
 from networks import ViTEncoder, ConvEncoder
 
@@ -646,6 +647,9 @@ def train(cfg: DictConfig):
     opt_actor = optim.Adam(actor.parameters(), lr=cfg.train.lr)
     opt_critic = optim.Adam(critic.parameters(), lr=cfg.train.lr)
 
+    use_fp16 = cfg.train.fp16
+    scaler = GradScaler() if use_fp16 else None
+
     # === Resume logic ===
     start_rollout_idx = 1
     if cfg.train.resume:
@@ -835,23 +839,35 @@ def train(cfg: DictConfig):
                 mb_ret = ret_buf[mb_inds]
                 mb_logp_old = logp_buf[mb_inds]
                 # Actor update
-                dist = actor(mb_obs)
-                logp = dist.log_prob(mb_act)
-                ratio = (logp - mb_logp_old).exp()
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - clip_eps,
-                                    1.0 + clip_eps) * mb_adv
-                loss_pi = -torch.min(surr1, surr2).mean()
+                with autocast(device_type='cuda', enabled=use_fp16):
+                    dist = actor(mb_obs)
+                    logp = dist.log_prob(mb_act)
+                    ratio = (logp - mb_logp_old).exp()
+                    surr1 = ratio * mb_adv
+                    surr2 = torch.clamp(ratio, 1.0 - clip_eps,
+                                        1.0 + clip_eps) * mb_adv
+                    loss_pi = -torch.min(surr1, surr2).mean()
                 opt_actor.zero_grad()
-                loss_pi.backward()
-                opt_actor.step()
+                if use_fp16:
+                    scaler.scale(loss_pi).backward()
+                    scaler.step(opt_actor)
+                    scaler.update()
+                else:
+                    loss_pi.backward()
+                    opt_actor.step()
                 actor_losses.append(loss_pi.item())
                 # Critic update
-                value = critic(mb_obs).squeeze(-1)
-                loss_v = F.mse_loss(value, mb_ret)
+                with autocast(device_type='cuda', enabled=use_fp16):
+                    value = critic(mb_obs).squeeze(-1)
+                    loss_v = F.mse_loss(value, mb_ret)
                 opt_critic.zero_grad()
-                loss_v.backward()
-                opt_critic.step()
+                if use_fp16:
+                    scaler.scale(loss_v).backward()
+                    scaler.step(opt_critic)
+                    scaler.update()
+                else:
+                    loss_v.backward()
+                    opt_critic.step()
                 critic_losses.append(loss_v.item())
         # Log losses
         writer.add_scalar('Loss/Actor', np.mean(actor_losses), rollout_idx)
