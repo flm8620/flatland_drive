@@ -92,7 +92,8 @@ class DrivingEnv(gym.Env):
                  pyramid_scales,
                  num_levels,
                  min_start_goal_dist=50,
-                 max_start_goal_dist=200):
+                 max_start_goal_dist=200,
+                 seed=None):
         super().__init__()
         self.map_h, self.map_w = 512, 512
         self.view_size = view_size
@@ -119,17 +120,19 @@ class DrivingEnv(gym.Env):
                                             shape=(self.num_levels, 4,
                                                    view_size, view_size),
                                             dtype=np.float32)
-        self.seed()
+        self.seed(seed)
         self.max_steps = max_steps
         self._step_count = 0
         self.min_start_goal_dist = min_start_goal_dist
         self.max_start_goal_dist = max_start_goal_dist
         self.is_done = None
+        self.np_random = None
 
     def seed(self, seed=None):
-        if seed is not None:
-            np.random.seed(seed)
-        self._seed = seed or np.random.randint(1e6)
+        if seed is None:
+            seed = int(time.time() * 1e6) % (2**32 - 1)
+        self._seed = seed
+        self.np_random = np.random.default_rng(seed)
         return [self._seed]
 
     def _generate_map(self):
@@ -139,7 +142,8 @@ class DrivingEnv(gym.Env):
         max_dist = self.max_start_goal_dist
 
         while True:
-            M = np.random.rand(self.map_h, self.map_w).astype(np.float32)
+            M = self.np_random.random((self.map_h, self.map_w),
+                                      dtype=np.float32)
             # set border to strong positive value as world border
             BORDER_VALUE = 1.5
             M[0, :] = BORDER_VALUE
@@ -171,7 +175,7 @@ class DrivingEnv(gym.Env):
                 continue  # Not enough drivable area, regenerate
 
             # Randomly pick a target
-            idx_t = np.random.randint(len(xs_e))
+            idx_t = self.np_random.integers(len(xs_e))
             tx, ty = xs_e[idx_t], ys_e[idx_t]
 
             # BFS flood-fill from (ty, tx) over the eroded mask
@@ -199,7 +203,7 @@ class DrivingEnv(gym.Env):
                 continue  # No valid start, regenerate map
 
             # Randomly select one as start
-            sy, sx = pts[np.random.randint(len(pts))]
+            sy, sx = pts[self.np_random.integers(len(pts))]
             self.start = np.array([sx, sy], dtype=np.int32)
             self.target = np.array([tx, ty], dtype=np.int32)
             elapsed = time.time() - start_time
@@ -609,26 +613,27 @@ def compute_gae(rewards, values, is_terminals, gamma, lam, the_extra_value,
 
 
 def make_env(cfg, run_dir, episode_offset=0):
+    env_seed = int(time.time() * 1e6) % (2**32 - 1) + episode_offset * 10000
 
     def _thunk():
-        return DrivingEnv(
-            render_dir=run_dir,  # Only one env should save video if needed
-            view_size=cfg.env.view_size,
-            dt=cfg.env.dt,
-            a_max=cfg.env.a_max,
-            v_max=cfg.env.v_max,
-            w_col=cfg.env.w_col,
-            R_goal=cfg.env.R_goal,
-            disk_radius=cfg.env.disk_radius,
-            video_fps=cfg.env.video_fps,
-            w_dist=cfg.env.w_dist,
-            w_accel=cfg.env.w_accel,
-            max_steps=cfg.train.max_steps,
-            hitwall_cost=cfg.env.hitwall_cost,
-            pyramid_scales=cfg.env.pyramid_scales,
-            num_levels=cfg.env.num_levels,
-            min_start_goal_dist=cfg.env.min_start_goal_dist,
-            max_start_goal_dist=cfg.env.max_start_goal_dist)
+        return DrivingEnv(render_dir=run_dir,
+                          view_size=cfg.env.view_size,
+                          dt=cfg.env.dt,
+                          a_max=cfg.env.a_max,
+                          v_max=cfg.env.v_max,
+                          w_col=cfg.env.w_col,
+                          R_goal=cfg.env.R_goal,
+                          disk_radius=cfg.env.disk_radius,
+                          video_fps=cfg.env.video_fps,
+                          w_dist=cfg.env.w_dist,
+                          w_accel=cfg.env.w_accel,
+                          max_steps=cfg.train.max_steps,
+                          hitwall_cost=cfg.env.hitwall_cost,
+                          pyramid_scales=cfg.env.pyramid_scales,
+                          num_levels=cfg.env.num_levels,
+                          min_start_goal_dist=cfg.env.min_start_goal_dist,
+                          max_start_goal_dist=cfg.env.max_start_goal_dist,
+                          seed=env_seed)
 
     return _thunk
 
@@ -708,7 +713,9 @@ def train(cfg: DictConfig):
         VecEnvClass = SyncVectorEnv
     else:
         raise ValueError(f"Unknown vector type: {vector_type}")
-    env_fns = [make_env(cfg, run_dir) for _ in range(num_envs)]
+    env_fns = [
+        make_env(cfg, run_dir, episode_offset=i) for i in range(num_envs)
+    ]
     envs = VecEnvClass(env_fns)
     obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
     buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape, device)
@@ -723,8 +730,10 @@ def train(cfg: DictConfig):
         # --- Video recording for the whole rollout ---
         render_this_rollout = (cfg.env.render_every > 0
                                and rollout_idx % cfg.env.render_every == 0)
-        video_frames = [] if render_this_rollout else None
-        video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}.mp4")
+        video_frames = None
+        if render_this_rollout:
+            video_frames = [[] for _ in range(cfg.env.num_envs)]
+        # video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}.mp4")  # Remove old single-env path
         next_obs, _ = envs.reset()
         next_obs = torch.as_tensor(next_obs,
                                    device=device,
@@ -756,28 +765,19 @@ def train(cfg: DictConfig):
 
             if render_this_rollout:
                 t0 = time.time()
-                # Only record video for the first env
-                info0 = {}
-                for key in infos:
-                    info0[key] = infos[key][0]
-
-                env0_vel = infos['vel'][0]
-
-                frame = get_human_frame(obs=cur_obs[0].cpu().numpy(),
-                                        vel=env0_vel,
-                                        v_max=cfg.env.v_max,
-                                        action=action[0],
-                                        info=info0,
-                                        a_max=cfg.env.a_max)
+                # Record video for all envs
+                for env_id in cfg.env.render_env_ids:
+                    info_env = {key: infos[key][env_id] for key in infos}
+                    env_vel = infos['vel'][env_id]
+                    frame = get_human_frame(obs=cur_obs[env_id].cpu().numpy(),
+                                            vel=env_vel,
+                                            v_max=cfg.env.v_max,
+                                            action=action[env_id],
+                                            info=info_env,
+                                            a_max=cfg.env.a_max)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    video_frames[env_id].append(frame_rgb)
                 t_render += time.time() - t0
-
-                t0 = time.time()
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                t_cv += time.time() - t0
-
-                t0 = time.time()
-                video_frames.append(frame_rgb)
-                t_append += time.time() - t0
 
             t0 = time.time()
             # Add batched data to buffer
@@ -800,11 +800,14 @@ def train(cfg: DictConfig):
         with torch.no_grad():
             next_value = critic(next_obs).squeeze(-1)
         # --- Save video for this rollout ---
-        if render_this_rollout and video_frames:
-            imageio.mimsave(video_path,
-                            video_frames,
-                            fps=cfg.env.video_fps,
-                            codec='libx264')
+        if render_this_rollout:
+            for env_id in cfg.env.render_env_ids:
+                video_path = os.path.join(
+                    run_dir, f"rollout_{rollout_idx:05d}_env{env_id}.mp4")
+                imageio.mimsave(video_path,
+                                video_frames[env_id],
+                                fps=cfg.env.video_fps,
+                                codec='libx264')
         record_time = time.time() - record_start_time
         print(
             f"[INFO] Rollout {rollout_idx}: Record took {record_time:.3f} s.")
