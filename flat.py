@@ -809,6 +809,8 @@ def train(cfg: DictConfig):
                                 fps=cfg.env.video_fps,
                                 codec='libx264')
         record_time = time.time() - record_start_time
+        # Log record time to TensorBoard
+        writer.add_scalar('Time/Record', record_time, rollout_idx)
         print(
             f"[INFO] Rollout {rollout_idx}: Record took {record_time:.3f} s.")
         print(
@@ -885,6 +887,9 @@ def train(cfg: DictConfig):
                               avg_discounted_reward, rollout_idx)
         update_time = time.time() - update_start_time
         rollout_time = time.time() - rollout_start_time
+        # Log update and total rollout time to TensorBoard
+        writer.add_scalar('Time/Update', update_time, rollout_idx)
+        writer.add_scalar('Time/Rollout', rollout_time, rollout_idx)
         print(
             f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s."
         )
