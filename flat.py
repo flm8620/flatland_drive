@@ -1,5 +1,5 @@
 '''
-We want to create a Renforcement Learning Playground project. 
+We want to create a Reinforcement Learning Playground project. 
 In this project, I want to train a network for autonomous driving. 
 To simplify the task, I will assume each agent (car) is a disk in 2D world. 
 And the driver can only control the acceleration vector in x y plane for each frame. 
