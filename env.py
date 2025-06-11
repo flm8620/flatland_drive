@@ -164,7 +164,27 @@ class DrivingEnv(gym.Env):
             print(
                 f"[DrivingEnv] Map generated in {elapsed:.3f} seconds. Start-goal dist: {dists[sy, sx]:.1f}"
             )
+            # Compute geodesic distance map after map generation
+            self._compute_geodesic_distance_map()
             break
+
+    def _compute_geodesic_distance_map(self):
+        """
+        Compute the smooth geodesic (quasi-Euclidean) distance from every drivable cell to the target using scikit-image's MCP_Geometric.
+        The result is stored in self.geodesic_dist_map (float32, shape=(map_h, map_w)).
+        Walls (cost_map > 0) are treated as obstacles (infinite cost).
+        """
+        from skimage.graph import MCP_Geometric
+        # Mask: True for drivable, False for wall
+        drivable_mask = (self.cost_map == 0)
+        # MCP_Geometric expects costs: 0 for wall, 1 for drivable
+        costs = np.where(drivable_mask, 1.0, np.inf)
+        mcp = MCP_Geometric(costs)
+        # Target is (row, col) = (y, x)
+        ty, tx = self.target[1], self.target[0]
+        # Compute distances from target to all points
+        dist_map, _ = mcp.find_costs([(ty, tx)])
+        self.geodesic_dist_map = dist_map.astype(np.float32)
 
     def visualize_map(self, filename='map.png'):
         """
@@ -207,8 +227,9 @@ class DrivingEnv(gym.Env):
         self.vel = np.zeros(2, dtype=np.float32)
         obs = self._get_obs()
         self._step_count = 0  # Reset step counter
-        self._prev_dist_to_goal = np.linalg.norm(self.pos - self.target)
-
+        # Use geodesic distance for progress reward
+        x, y = int(self.pos[0]), int(self.pos[1])
+        self._prev_dist_to_goal = self.geodesic_dist_map[y, x]
         return obs, {}
 
     def step(self, action):
@@ -255,10 +276,10 @@ class DrivingEnv(gym.Env):
         r_col = 0.0
 
         # goal
-        dist_to_goal = np.linalg.norm(self.pos - self.target)
+        dist_to_goal = self.geodesic_dist_map[y_i, x_i]
         terminated = dist_to_goal < self.disk_radius * 2
         r_goal = self.R_goal if terminated else 0.0
-        # Progress reward: positive if moving closer to goal
+        # Progress reward: positive if moving closer to goal (using geodesic distance)
         progress = self._prev_dist_to_goal - dist_to_goal
         r_progress = self.w_dist * progress  # per-pixel, not normalized
         self._prev_dist_to_goal = dist_to_goal
@@ -329,6 +350,35 @@ class DrivingEnv(gym.Env):
         obs = np.stack(levels, axis=0).astype(np.float32)
         return obs
 
+    def visualize_distance_map(self, filename='distance_map.png', period=20.0):
+        """
+        Visualize the geodesic distance map with a periodic colormap to show contour-like effects.
+        - Uses a periodic (e.g., sine or modulo) mapping to highlight contours.
+        - Saves the image to render_dir/filename.
+        """
+        if not self.render_dir:
+            return
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        dist = self.geodesic_dist_map.copy()
+        # Mask walls as nan for visualization
+        dist[self.cost_map > 0] = np.nan
+        # Periodic colormap: use modulo to create contours
+        contour = np.mod(dist, period)
+        # Normalize for colormap
+        norm = mcolors.Normalize(vmin=0, vmax=period)
+        # Use a cyclic colormap (e.g., 'hsv' or 'twilight')
+        cmap = plt.get_cmap('twilight')
+        img = cmap(norm(contour))[:, :, :3]  # Drop alpha
+        # Overlay start and target
+        sy, sx = self.start[1], self.start[0]
+        ty, tx = self.target[1], self.target[0]
+        img[sy-3:sy+4, sx-3:sx+4, :] = [0, 1, 0]  # Green for start
+        img[ty-3:ty+4, tx-3:tx+4, :] = [1, 0, 0]  # Red for target
+        # Save as PNG
+        path = os.path.join(self.render_dir, filename)
+        plt.imsave(path, img)
+        plt.close()
 
 def obs_level_to_image(obs_level, canvas_size):
     """

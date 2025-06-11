@@ -313,6 +313,15 @@ def train(cfg: DictConfig):
         gamma_pow = np.ones(num_envs, dtype=np.float32)
         gamma = cfg.train.gamma
         t_infer = t_env = t_render = t_cv = t_buffer = t_append = 0.0
+
+        # Visualize distance map for each env at the start of training
+        if False:
+            for i in range(num_envs):
+                # envs.envs[i] is the underlying DrivingEnv instance
+                env = envs.envs[i]
+                env.visualize_distance_map(
+                    filename=f'distance_map_rollout{rollout_idx}_env{i}.png')
+
         # --- Success/failure counting (integer counters) ---
         success_count = 0
         failure_count = 0
@@ -465,8 +474,10 @@ def train(cfg: DictConfig):
                               avg_discounted_reward, rollout_idx)
         avg_successes_per_env = success_count / num_envs
         avg_failures_per_env = failure_count / num_envs
-        writer.add_scalar('Reward/AvgSuccess', np.mean(avg_successes_per_env), rollout_idx)
-        writer.add_scalar('Reward/AvgFailure', np.mean(avg_failures_per_env), rollout_idx)
+        writer.add_scalar('Reward/AvgSuccess', np.mean(avg_successes_per_env),
+                          rollout_idx)
+        writer.add_scalar('Reward/AvgFailure', np.mean(avg_failures_per_env),
+                          rollout_idx)
         update_time = time.time() - update_start_time
         rollout_time = time.time() - rollout_start_time
         # Log update and total rollout time to TensorBoard
