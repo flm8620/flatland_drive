@@ -39,7 +39,7 @@ train:
   episodes: 500
   max_steps: 2000
   save_every: 10
-  num_rollouts: 1000 
+  num_rollouts: 2000 
   fp16: false
 
 # Logging

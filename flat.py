@@ -313,6 +313,9 @@ def train(cfg: DictConfig):
         gamma_pow = np.ones(num_envs, dtype=np.float32)
         gamma = cfg.train.gamma
         t_infer = t_env = t_render = t_cv = t_buffer = t_append = 0.0
+        # --- Success/failure counting (integer counters) ---
+        success_count = 0
+        failure_count = 0
         for step in range(rollout_steps):
             cur_obs = next_obs
             is_current_terminal = is_next_terminal.copy()
@@ -366,6 +369,12 @@ def train(cfg: DictConfig):
                         episode_rewards[i].append(sum(cur_episode_rewards[i]))
                     cur_episode_rewards[i] = []
                     gamma_pow[i] = 1.0
+                    # --- Count success/failure at episode end ---
+                    if terminated[i]:
+                        if infos['success'][i]:
+                            success_count += 1
+                        else:
+                            failure_count += 1
         with torch.no_grad():
             next_value = critic(next_obs).squeeze(-1)
         # --- Save video for this rollout ---
@@ -454,6 +463,10 @@ def train(cfg: DictConfig):
             avg_discounted_reward = np.mean(flat_episode_rewards)
             writer.add_scalar('Reward/AvgDiscountedEpisode',
                               avg_discounted_reward, rollout_idx)
+        avg_successes_per_env = success_count / num_envs
+        avg_failures_per_env = failure_count / num_envs
+        writer.add_scalar('Reward/AvgSuccess', np.mean(avg_successes_per_env), rollout_idx)
+        writer.add_scalar('Reward/AvgFailure', np.mean(avg_failures_per_env), rollout_idx)
         update_time = time.time() - update_start_time
         rollout_time = time.time() - rollout_start_time
         # Log update and total rollout time to TensorBoard

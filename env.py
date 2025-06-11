@@ -245,7 +245,8 @@ class DrivingEnv(gym.Env):
                 'hitwall': reward,
                 'r_progress': 0.0,
                 'r_goal': 0.0,
-                'r_col': 0.0
+                'r_col': 0.0,
+                'success': False  # Not a success if hit wall
             }
             self.is_done = terminated or truncated
             return obs, reward, terminated, truncated, info
@@ -273,6 +274,7 @@ class DrivingEnv(gym.Env):
             'r_col': r_col,
             'r_time': r_time,
             'vel': self.vel.copy(),
+            'success': terminated,
         }
 
         self.is_done = terminated or truncated
