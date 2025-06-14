@@ -298,7 +298,8 @@ def train(cfg: DictConfig):
         record_start_time = time.time()
         # --- Video recording for the whole rollout ---
         render_this_rollout = (cfg.env.render_every > 0
-                               and rollout_idx % cfg.env.render_every == 0)
+                               and rollout_idx % cfg.env.render_every == 0
+                               or rollout_idx == 1)
         video_frames = None
         if render_this_rollout:
             video_frames = [[] for _ in range(cfg.env.num_envs)]
@@ -405,25 +406,32 @@ def train(cfg: DictConfig):
         )
         update_start_time = time.time()
         # Compute GAE and returns
-        obs_buf, act_buf, rew_buf, terminal_buf, logp_buf, val_buf = buffer.get(
+        obs_buf, act_buf, _rew_buf, _terminal_buf, logp_buf, _val_buf = buffer.get(
         )
         # For GAE, use unflattened shapes
-        obs_raw, act_raw, rew_raw, terminal_raw, logp_raw, val_raw = buffer.get_raw(
+        _obs_raw, _act_raw, rew_raw, terminal_raw, _logp_raw, val_raw = buffer.get_raw(
         )
         adv_buf, ret_buf = compute_gae(
             rew_raw, val_raw, terminal_raw, gamma, lam, next_value,
             torch.as_tensor(is_next_terminal,
                             device=device,
                             dtype=torch.float32))
-        adv_buf = adv_buf.reshape(-1)
-        ret_buf = ret_buf.reshape(-1)
+        
+        is_valid_buf = ~terminal_raw.reshape(-1)
+        adv_buf = adv_buf.reshape(-1)[is_valid_buf]
+        ret_buf = ret_buf.reshape(-1)[is_valid_buf]
+        obs_buf = obs_buf[is_valid_buf]
+        act_buf = act_buf[is_valid_buf]
+        logp_buf = logp_buf[is_valid_buf]
+
+
         adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
         # PPO update
-        inds = torch.randperm(rollout_steps * num_envs)
+        inds = torch.randperm(adv_buf.shape[0], device=device)
         actor_losses = []
         critic_losses = []
         for _ in range(ppo_epochs):
-            for start in range(0, rollout_steps * num_envs, minibatch_size):
+            for start in range(0, adv_buf.shape[0], minibatch_size):
                 mb_inds = inds[start:start + minibatch_size]
                 mb_obs = obs_buf[mb_inds]
                 mb_act = act_buf[mb_inds]
