@@ -158,6 +158,9 @@ class DrivingEnv(gym.Env):
 
             # Randomly select one as start
             sy, sx = pts[self.np_random.integers(len(pts))]
+            # Notice that for start and target, we use interger pixel index as coordinates
+            # for float point coordinate, we think they are centered at the pixel square,
+            # which coordinate should be (sx + 0.5, sy + 0.5) and (tx + 0.5, ty + 0.5)
             self.start = np.array([sx, sy], dtype=np.int32)
             self.target = np.array([tx, ty], dtype=np.int32)
             elapsed = time.time() - start_time
@@ -223,7 +226,7 @@ class DrivingEnv(gym.Env):
         # Regenerate the map for each episode
         self._generate_map()
         # Set agent to the designated start position from map generation
-        self.pos = self.start.astype(np.float32)
+        self.pos = self.start.astype(np.float32) + 0.5  # +0.5 for pixel center
         self.vel = np.zeros(2, dtype=np.float32)
         obs = self._get_obs()
         self._step_count = 0  # Reset step counter
@@ -252,7 +255,6 @@ class DrivingEnv(gym.Env):
         # costs
         x_i, y_i = int(self.pos[0]), int(self.pos[1])
         cost = self.cost_map[y_i, x_i]
-        # r_step removed since wall collision now terminates with -100
 
         self._step_count += 1
         truncated = self._step_count >= self.max_steps
@@ -307,10 +309,12 @@ class DrivingEnv(gym.Env):
             size = self.view_size
             crop_size = int(size * scale)
             x, y = self.pos
+            x = int(round(x))
+            y = int(round(y))
             half = crop_size // 2
-            x0 = int(x) - half
+            x0 = x - half
             x1 = x0 + crop_size
-            y0 = int(y) - half
+            y0 = y - half
             y1 = y0 + crop_size
             # Pad if out of bounds
             pad_x0, pad_y0 = max(0, -x0), max(0, -y0)
@@ -334,8 +338,8 @@ class DrivingEnv(gym.Env):
             tx, ty = self.target
             # Compute target position in this crop
             if x0 <= tx < x1 and y0 <= ty < y1:
-                tx_rel = int((tx - x0) / scale)
-                ty_rel = int((ty - y0) / scale)
+                tx_rel = int((0.5 + (tx - x0)) / scale)
+                ty_rel = int((0.5 + (ty - y0)) / scale)
                 if 0 <= tx_rel < self.view_size and 0 <= ty_rel < self.view_size:
                     # Draw a filled square (5x5) in numpy for target
                     y_start = max(0, ty_rel - 2)
@@ -343,6 +347,13 @@ class DrivingEnv(gym.Env):
                     x_start = max(0, tx_rel - 2)
                     x_end = min(self.view_size, tx_rel + 3)
                     target_map[y_start:y_end, x_start:x_end] = 1.0
+                    
+            # Always paint the center of observation, as the indicator of self
+            center_x = self.view_size // 2
+            center_y = self.view_size // 2
+            target_map[center_y - 2:center_y + 2,
+                       center_x - 2:center_x + 2] = 0.5
+
             # Stack: cost, vx, vy, target
             level = np.stack([view, vx, vy, target_map], axis=0)  # (4, H, W)
             levels.append(level)
@@ -373,12 +384,13 @@ class DrivingEnv(gym.Env):
         # Overlay start and target
         sy, sx = self.start[1], self.start[0]
         ty, tx = self.target[1], self.target[0]
-        img[sy-3:sy+4, sx-3:sx+4, :] = [0, 1, 0]  # Green for start
-        img[ty-3:ty+4, tx-3:tx+4, :] = [1, 0, 0]  # Red for target
+        img[sy - 3:sy + 4, sx - 3:sx + 4, :] = [0, 1, 0]  # Green for start
+        img[ty - 3:ty + 4, tx - 3:tx + 4, :] = [1, 0, 0]  # Red for target
         # Save as PNG
         path = os.path.join(self.render_dir, filename)
         plt.imsave(path, img)
         plt.close()
+
 
 def obs_level_to_image(obs_level, canvas_size):
     """
