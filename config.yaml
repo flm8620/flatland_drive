@@ -23,8 +23,19 @@ env:
   hitwall_cost: -50.0
   pyramid_scales: [1, 4, 16]
   num_levels: 3
-  min_start_goal_dist: 20   # Minimum allowed distance between start and goal
-  max_start_goal_dist: 150  # Maximum allowed distance between start and goal
+  curriculum:
+    - min_start_goal_dist: 10
+      max_start_goal_dist: 20
+      hitwall_cost: -10.0
+      until_rollout: 100
+    - min_start_goal_dist: 20
+      max_start_goal_dist: 50
+      hitwall_cost: -50.0
+      until_rollout: 300
+    - min_start_goal_dist: 50
+      max_start_goal_dist: 200
+      hitwall_cost: -300.0
+      until_rollout: 999999
 
 # Training
 train:

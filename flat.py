@@ -181,7 +181,7 @@ def compute_gae(rewards, values, is_terminals, gamma, lam, the_extra_value,
     return adv, returns
 
 
-def make_env(cfg, run_dir, episode_offset=0):
+def make_env(cfg, run_dir, episode_offset=0, min_start_goal_dist=None, max_start_goal_dist=None, hitwall_cost=None):
     env_seed = int(time.time() * 1e6) % (2**32 - 1) + episode_offset * 10000
 
     def _thunk():
@@ -197,11 +197,11 @@ def make_env(cfg, run_dir, episode_offset=0):
                           w_dist=cfg.env.w_dist,
                           w_accel=cfg.env.w_accel,
                           max_steps=cfg.train.max_steps,
-                          hitwall_cost=cfg.env.hitwall_cost,
+                          hitwall_cost=hitwall_cost,
                           pyramid_scales=cfg.env.pyramid_scales,
                           num_levels=cfg.env.num_levels,
-                          min_start_goal_dist=cfg.env.min_start_goal_dist,
-                          max_start_goal_dist=cfg.env.max_start_goal_dist,
+                          min_start_goal_dist=min_start_goal_dist,
+                          max_start_goal_dist=max_start_goal_dist,
                           seed=env_seed)
 
     return _thunk
@@ -275,25 +275,41 @@ def train(cfg: DictConfig):
 
     num_envs = cfg.env.num_envs
     # Vectorized env with switch
-    vector_type = cfg.env.vector_type
-    if vector_type == 'async':
-        VecEnvClass = AsyncVectorEnv
-    elif vector_type == 'sync':
-        VecEnvClass = SyncVectorEnv
-    else:
-        raise ValueError(f"Unknown vector type: {vector_type}")
-    env_fns = [
-        make_env(cfg, run_dir, episode_offset=i) for i in range(num_envs)
-    ]
-    envs = VecEnvClass(env_fns)
     obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
     buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape, device)
 
     num_rollouts = cfg.train.num_rollouts
     rollout_steps = cfg.train.rollout_steps
+    # Curriculum from config
+    curriculum = cfg.env.curriculum
     for rollout_idx in range(start_rollout_idx, num_rollouts + 1):
+        # === Curriculum learning: select env difficulty from config ===
+        if curriculum:
+            for stage in curriculum:
+                if rollout_idx <= stage['until_rollout']:
+                    min_start_goal_dist = stage['min_start_goal_dist']
+                    max_start_goal_dist = stage['max_start_goal_dist']
+                    hitwall_cost = stage['hitwall_cost']
+                    break
+        else:
+            raise RuntimeError('No curriculum defined in config!')
+        # Create envs for this rollout with correct curriculum params
+        env_fns = [
+            make_env(cfg, run_dir, episode_offset=i,
+                     min_start_goal_dist=min_start_goal_dist,
+                     max_start_goal_dist=max_start_goal_dist,
+                     hitwall_cost=hitwall_cost)
+            for i in range(num_envs)
+        ]
+        if cfg.env.vector_type == 'async':
+            VecEnvClass = AsyncVectorEnv
+        elif cfg.env.vector_type == 'sync':
+            VecEnvClass = SyncVectorEnv
+        else:
+            raise ValueError(f"Unknown vector type: {cfg.env.vector_type}")
+        envs = VecEnvClass(env_fns)
         rollout_start_time = time.time()
-        print(f"[INFO] Rollout {rollout_idx}: Start recording transitions...")
+        print(f"[INFO] Rollout {rollout_idx}: Start recording transitions... (min/max dist: {min_start_goal_dist}-{max_start_goal_dist}, hitwall: {hitwall_cost})")
         buffer.reset()
         record_start_time = time.time()
         # --- Video recording for the whole rollout ---
