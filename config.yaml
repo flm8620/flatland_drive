@@ -40,7 +40,7 @@ env:
 # Training
 train:
   resume: true
-  lr: 0.002
+  lr: 0.001
   gamma: 0.99
   gae_lambda: 0.95
   rollout_steps: 2048
