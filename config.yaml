@@ -40,14 +40,13 @@ env:
 # Training
 train:
   resume: true
-  lr: 0.001
+  lr: 0.0005
   gamma: 0.99
   gae_lambda: 0.95
   rollout_steps: 2048
-  ppo_epochs: 8
-  minibatch_size: 128
+  ppo_epochs: 4
+  minibatch_size: 64
   clip_eps: 0.2
-  episodes: 500
   max_steps: 2000
   save_every: 10
   num_rollouts: 2000 
