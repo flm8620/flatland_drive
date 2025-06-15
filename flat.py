@@ -417,7 +417,7 @@ def train(cfg: DictConfig):
                             device=device,
                             dtype=torch.float32))
         
-        is_valid_buf = ~terminal_raw.reshape(-1)
+        is_valid_buf = (terminal_raw == 0).reshape(-1)
         adv_buf = adv_buf.reshape(-1)[is_valid_buf]
         ret_buf = ret_buf.reshape(-1)[is_valid_buf]
         obs_buf = obs_buf[is_valid_buf]
