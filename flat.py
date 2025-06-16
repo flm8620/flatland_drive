@@ -139,19 +139,9 @@ class RolloutBuffer:
         if self.ptr >= self.n_steps:
             self.full = True
 
-    def get(self):
-        assert self.full, "Buffer not full yet!"
-        # Return as (n_steps * n_envs, ...) for training
-        obs = self.obs.reshape(-1, *self.obs.shape[2:])
-        actions = self.actions.reshape(-1)
-        rewards = self.rewards.reshape(-1)
-        is_terminals = self.is_terminals.reshape(-1)
-        logprobs = self.logprobs.reshape(-1)
-        values = self.values.reshape(-1)
-        return obs, actions, rewards, is_terminals, logprobs, values
-
     def get_raw(self):
-        # Return as (n_steps, n_envs, ...)
+        assert self.full, "Buffer not full yet!"
+        # Return as (n_steps, n_envs, ...) for training
         return self.obs, self.actions, self.rewards, self.is_terminals, self.logprobs, self.values
 
     def reset(self):
@@ -276,7 +266,6 @@ def train(cfg: DictConfig):
     num_envs = cfg.env.num_envs
     # Vectorized env with switch
     obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
-    buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape, device)
 
     num_rollouts = cfg.train.num_rollouts
     rollout_steps = cfg.train.rollout_steps
@@ -310,7 +299,7 @@ def train(cfg: DictConfig):
         envs = VecEnvClass(env_fns)
         rollout_start_time = time.time()
         print(f"[INFO] Rollout {rollout_idx}: Start recording transitions... (min/max dist: {min_start_goal_dist}-{max_start_goal_dist}, hitwall: {hitwall_cost})")
-        buffer.reset()
+        buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape, device)
         record_start_time = time.time()
         # --- Video recording for the whole rollout ---
         render_this_rollout = (cfg.env.render_every > 0
@@ -422,23 +411,20 @@ def train(cfg: DictConfig):
         )
         update_start_time = time.time()
         # Compute GAE and returns
-        obs_buf, act_buf, _rew_buf, _terminal_buf, logp_buf, _val_buf = buffer.get(
-        )
-        # For GAE, use unflattened shapes
-        _obs_raw, _act_raw, rew_raw, terminal_raw, _logp_raw, val_raw = buffer.get_raw(
-        )
+        obs_raw, act_raw, rew_raw, terminal_raw, logp_raw, val_raw = buffer.get_raw()
+        del buffer
         adv_buf, ret_buf = compute_gae(
             rew_raw, val_raw, terminal_raw, gamma, lam, next_value,
             torch.as_tensor(is_next_terminal,
                             device=device,
                             dtype=torch.float32))
-        
+        # Flatten for training
         is_valid_buf = (terminal_raw == 0).reshape(-1)
+        obs_buf = obs_raw.reshape(-1, *obs_raw.shape[2:])[is_valid_buf]
+        act_buf = act_raw.reshape(-1)[is_valid_buf]
+        logp_buf = logp_raw.reshape(-1)[is_valid_buf]
         adv_buf = adv_buf.reshape(-1)[is_valid_buf]
         ret_buf = ret_buf.reshape(-1)[is_valid_buf]
-        obs_buf = obs_buf[is_valid_buf]
-        act_buf = act_buf[is_valid_buf]
-        logp_buf = logp_buf[is_valid_buf]
 
 
         adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
