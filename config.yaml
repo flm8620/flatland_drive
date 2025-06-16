@@ -27,11 +27,15 @@ env:
     - min_start_goal_dist: 10
       max_start_goal_dist: 20
       hitwall_cost: -10.0
-      until_rollout: 100
+      until_rollout: 30
     - min_start_goal_dist: 20
       max_start_goal_dist: 50
       hitwall_cost: -50.0
-      until_rollout: 300
+      until_rollout: 80
+    - min_start_goal_dist: 30
+      max_start_goal_dist: 100
+      hitwall_cost: -100.0
+      until_rollout: 150
     - min_start_goal_dist: 50
       max_start_goal_dist: 200
       hitwall_cost: -300.0
@@ -40,15 +44,15 @@ env:
 # Training
 train:
   resume: true
-  lr: 0.0005
+  lr: 0.001
   gamma: 0.99
   gae_lambda: 0.95
   rollout_steps: 2048
   ppo_epochs: 4
-  minibatch_size: 64
+  minibatch_size: 128
   clip_eps: 0.2
   max_steps: 2000
-  save_every: 10
+  save_every: 5
   num_rollouts: 2000 
   fp16: false
 
