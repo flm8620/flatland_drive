@@ -102,46 +102,31 @@ class Critic(nn.Module):
 ##########################
 class RolloutBuffer:
 
-    def __init__(self, n_steps, n_envs, obs_shape, device):
+    def __init__(self, n_steps, n_envs, obs_shape):
         self.n_steps = n_steps
         self.n_envs = n_envs
-        self.device = device
         self.ptr = 0
         self.full = False
-        self.obs = torch.zeros((n_steps, n_envs, *obs_shape),
-                               dtype=torch.float32,
-                               device=device)
-        self.actions = torch.zeros((n_steps, n_envs),
-                                   dtype=torch.long,
-                                   device=device)
-        self.rewards = torch.zeros((n_steps, n_envs),
-                                   dtype=torch.float32,
-                                   device=device)
-        self.is_terminals = torch.zeros((n_steps, n_envs),
-                                        dtype=torch.float32,
-                                        device=device)
-        self.logprobs = torch.zeros((n_steps, n_envs),
-                                    dtype=torch.float32,
-                                    device=device)
-        self.values = torch.zeros((n_steps, n_envs),
-                                  dtype=torch.float32,
-                                  device=device)
+        self.obs = torch.zeros((n_steps, n_envs, *obs_shape), dtype=torch.float32, device='cpu')
+        self.actions = torch.zeros((n_steps, n_envs), dtype=torch.long, device='cpu')
+        self.rewards = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
+        self.is_terminals = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
+        self.logprobs = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
+        self.values = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
 
     def add(self, obs, action, reward, is_terminal, logprob, value):
-        # obs, action, reward, is_terminal, logprob, value: shape (n_envs, ...)
-        self.obs[self.ptr].copy_(obs)
-        self.actions[self.ptr].copy_(action)
-        self.rewards[self.ptr].copy_(reward)
-        self.is_terminals[self.ptr].copy_(is_terminal)
-        self.logprobs[self.ptr].copy_(logprob)
-        self.values[self.ptr].copy_(value)
+        self.obs[self.ptr].copy_(obs.cpu())
+        self.actions[self.ptr].copy_(action.cpu())
+        self.rewards[self.ptr].copy_(reward.cpu())
+        self.is_terminals[self.ptr].copy_(is_terminal.cpu())
+        self.logprobs[self.ptr].copy_(logprob.cpu())
+        self.values[self.ptr].copy_(value.cpu())
         self.ptr += 1
         if self.ptr >= self.n_steps:
             self.full = True
 
     def get_raw(self):
         assert self.full, "Buffer not full yet!"
-        # Return as (n_steps, n_envs, ...) for training
         return self.obs, self.actions, self.rewards, self.is_terminals, self.logprobs, self.values
 
     def reset(self):
@@ -299,7 +284,7 @@ def train(cfg: DictConfig):
         envs = VecEnvClass(env_fns)
         rollout_start_time = time.time()
         print(f"[INFO] Rollout {rollout_idx}: Start recording transitions... (min/max dist: {min_start_goal_dist}-{max_start_goal_dist}, hitwall: {hitwall_cost})")
-        buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape, device)
+        buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape)
         record_start_time = time.time()
         # --- Video recording for the whole rollout ---
         render_this_rollout = (cfg.env.render_every > 0
@@ -414,10 +399,9 @@ def train(cfg: DictConfig):
         obs_raw, act_raw, rew_raw, terminal_raw, logp_raw, val_raw = buffer.get_raw()
         del buffer
         adv_buf, ret_buf = compute_gae(
-            rew_raw, val_raw, terminal_raw, gamma, lam, next_value,
-            torch.as_tensor(is_next_terminal,
-                            device=device,
-                            dtype=torch.float32))
+            rew_raw, val_raw, terminal_raw, gamma, lam,
+            next_value.cpu(),
+            torch.as_tensor(is_next_terminal, device='cpu', dtype=torch.float32))
         # Flatten for training
         is_valid_buf = (terminal_raw == 0).reshape(-1)
         obs_buf = obs_raw.reshape(-1, *obs_raw.shape[2:])[is_valid_buf]
@@ -426,6 +410,12 @@ def train(cfg: DictConfig):
         adv_buf = adv_buf.reshape(-1)[is_valid_buf]
         ret_buf = ret_buf.reshape(-1)[is_valid_buf]
 
+        # Move to GPU for PPO update
+        obs_buf = obs_buf.to(device)
+        act_buf = act_buf.to(device)
+        logp_buf = logp_buf.to(device)
+        adv_buf = adv_buf.to(device)
+        ret_buf = ret_buf.to(device)
 
         adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
         # PPO update
