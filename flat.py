@@ -182,6 +182,191 @@ def make_env(cfg, run_dir, episode_offset=0, min_start_goal_dist=None, max_start
     return _thunk
 
 
+
+def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic):
+    """
+    Handles curriculum, creates envs, collects a rollout, logs stats, saves video, and returns only the buffer and next_value needed for PPO update.
+    """
+    # === Curriculum learning: select env difficulty from config ===
+    curriculum = cfg.env.curriculum
+    num_envs = cfg.env.num_envs
+    num_levels = cfg.env.num_levels
+    rollout_steps = cfg.train.rollout_steps
+    obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
+    if curriculum:
+        for stage in curriculum:
+            if rollout_idx <= stage['until_rollout']:
+                min_start_goal_dist = stage['min_start_goal_dist']
+                max_start_goal_dist = stage['max_start_goal_dist']
+                hitwall_cost = stage['hitwall_cost']
+                break
+    else:
+        raise RuntimeError('No curriculum defined in config!')
+    env_fns = [
+        make_env(cfg, run_dir, episode_offset=i,
+                 min_start_goal_dist=min_start_goal_dist,
+                 max_start_goal_dist=max_start_goal_dist,
+                 hitwall_cost=hitwall_cost)
+        for i in range(num_envs)
+    ]
+    if cfg.env.vector_type == 'async':
+        VecEnvClass = AsyncVectorEnv
+    elif cfg.env.vector_type == 'sync':
+        VecEnvClass = SyncVectorEnv
+    else:
+        raise ValueError(f"Unknown vector type: {cfg.env.vector_type}")
+    envs = VecEnvClass(env_fns)
+    print(f"[INFO] Rollout {rollout_idx}: Start recording transitions... (min/max dist: {min_start_goal_dist}-{max_start_goal_dist}, hitwall: {hitwall_cost})")
+    buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape)
+    gamma = cfg.train.gamma
+    render_this_rollout = (cfg.env.render_every > 0 and rollout_idx % cfg.env.render_every == 0 or rollout_idx == 1)
+    video_frames = None
+    if render_this_rollout:
+        video_frames = [[] for _ in range(cfg.env.num_envs)]
+    next_obs, _ = envs.reset()
+    next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float32)
+    is_next_terminal = np.zeros(num_envs, dtype=bool)
+    episode_rewards = [[] for _ in range(num_envs)]
+    cur_episode_rewards = [[] for _ in range(num_envs)]
+    gamma_pow = np.ones(num_envs, dtype=np.float32)
+    t_infer = t_env = t_render = t_cv = t_buffer = t_append = 0.0
+    success_count = 0
+    failure_count = 0
+    for step in range(rollout_steps):
+        cur_obs = next_obs
+        is_current_terminal = is_next_terminal.copy()
+        t0 = time.time()
+        with torch.no_grad():
+            dist = actor(cur_obs)
+            action = dist.sample()
+            logprob = dist.log_prob(action)
+            value = critic(cur_obs).squeeze(-1)
+        t_infer += time.time() - t0
+        t0 = time.time()
+        next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
+        next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float32)
+        t_env += time.time() - t0
+        if render_this_rollout:
+            t0 = time.time()
+            for env_id in cfg.env.render_env_ids:
+                info_env = {key: infos[key][env_id] for key in infos}
+                env_vel = infos['vel'][env_id]
+                frame = get_human_frame(obs=cur_obs[env_id].cpu().numpy(),
+                                        vel=env_vel,
+                                        v_max=cfg.env.v_max,
+                                        action=action[env_id],
+                                        info=info_env,
+                                        a_max=cfg.env.a_max)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                video_frames[env_id].append(frame_rgb)
+            t_render += time.time() - t0
+        t0 = time.time()
+        buffer.add(cur_obs, action, torch.as_tensor(reward, device=device),
+                   torch.as_tensor(is_current_terminal, device=device),
+                   logprob, value)
+        t_buffer += time.time() - t0
+        is_next_terminal = np.logical_or(terminated, truncated)
+        for i in range(num_envs):
+            if not is_current_terminal[i]:
+                cur_episode_rewards[i].append(reward[i] * gamma_pow[i])
+                gamma_pow[i] *= gamma
+            if is_next_terminal[i]:
+                if len(cur_episode_rewards[i]) > 0:
+                    episode_rewards[i].append(sum(cur_episode_rewards[i]))
+                cur_episode_rewards[i] = []
+                gamma_pow[i] = 1.0
+                if terminated[i]:
+                    if infos['success'][i]:
+                        success_count += 1
+                    else:
+                        failure_count += 1
+    with torch.no_grad():
+        next_value = critic(next_obs).squeeze(-1)
+    # --- Logging and video saving here ---
+    flat_episode_rewards = [r for sublist in episode_rewards for r in sublist]
+    writer = SummaryWriter(log_dir=run_dir)
+    print(f"[TIMER] Rollout {rollout_idx}: infer={t_infer:.3f}s, env={t_env:.3f}s, render={t_render:.3f}s, cvtColor={t_cv:.3f}s, buffer={t_buffer:.3f}s, append={t_append:.3f}s")
+    if flat_episode_rewards:
+        avg_discounted_reward = np.mean(flat_episode_rewards)
+        writer.add_scalar('Reward/AvgDiscountedEpisode', avg_discounted_reward, rollout_idx)
+    avg_successes_per_env = success_count / num_envs
+    avg_failures_per_env = failure_count / num_envs
+    writer.add_scalar('Reward/AvgSuccess', np.mean(avg_successes_per_env), rollout_idx)
+    writer.add_scalar('Reward/AvgFailure', np.mean(avg_failures_per_env), rollout_idx)
+    if render_this_rollout and video_frames is not None:
+        for env_id in cfg.env.render_env_ids:
+            video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}_env{env_id}.mp4")
+            imageio.mimsave(video_path, video_frames[env_id], fps=cfg.env.video_fps, codec='libx264')
+    # Only return what is needed for PPO update
+    return buffer, is_next_terminal, next_value
+
+
+def ppo_update(buffer, critic, actor, cfg, device, is_next_terminal, next_value, scaler, use_fp16, writer, rollout_idx, opt_actor, opt_critic):
+    gamma = cfg.train.gamma
+    lam = cfg.train.gae_lambda
+    ppo_epochs = cfg.train.ppo_epochs
+    minibatch_size = cfg.train.minibatch_size
+    clip_eps = cfg.train.clip_eps
+    obs_raw, act_raw, rew_raw, terminal_raw, logp_raw, val_raw = buffer.get_raw()
+    adv_buf, ret_buf = compute_gae(
+        rew_raw, val_raw, terminal_raw, gamma, lam,
+        next_value.cpu(),
+        torch.as_tensor(is_next_terminal, device='cpu', dtype=torch.float32))
+    is_valid_buf = (terminal_raw == 0).reshape(-1)
+    obs_buf = obs_raw.reshape(-1, *obs_raw.shape[2:])[is_valid_buf]
+    act_buf = act_raw.reshape(-1)[is_valid_buf]
+    logp_buf = logp_raw.reshape(-1)[is_valid_buf]
+    adv_buf = adv_buf.reshape(-1)[is_valid_buf]
+    ret_buf = ret_buf.reshape(-1)[is_valid_buf]
+    obs_buf = obs_buf.to(device)
+    act_buf = act_buf.to(device)
+    logp_buf = logp_buf.to(device)
+    adv_buf = adv_buf.to(device)
+    ret_buf = ret_buf.to(device)
+    adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
+    inds = torch.randperm(adv_buf.shape[0], device=device)
+    actor_losses = []
+    critic_losses = []
+    for _ in range(ppo_epochs):
+        for start in range(0, adv_buf.shape[0], minibatch_size):
+            mb_inds = inds[start:start + minibatch_size]
+            mb_obs = obs_buf[mb_inds]
+            mb_act = act_buf[mb_inds]
+            mb_adv = adv_buf[mb_inds]
+            mb_ret = ret_buf[mb_inds]
+            mb_logp_old = logp_buf[mb_inds]
+            with autocast(device_type='cuda', enabled=use_fp16):
+                dist = actor(mb_obs)
+                logp = dist.log_prob(mb_act)
+                ratio = (logp - mb_logp_old).exp()
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
+                loss_pi = -torch.min(surr1, surr2).mean()
+            opt_actor.zero_grad()
+            if use_fp16:
+                scaler.scale(loss_pi).backward()
+                scaler.step(opt_actor)
+                scaler.update()
+            else:
+                loss_pi.backward()
+                opt_actor.step()
+            actor_losses.append(loss_pi.item())
+            with autocast(device_type='cuda', enabled=use_fp16):
+                value = critic(mb_obs).squeeze(-1)
+                loss_v = F.mse_loss(value, mb_ret)
+            opt_critic.zero_grad()
+            if use_fp16:
+                scaler.scale(loss_v).backward()
+                scaler.step(opt_critic)
+                scaler.update()
+            else:
+                loss_v.backward()
+                opt_critic.step()
+            critic_losses.append(loss_v.item())
+    writer.add_scalar('Loss/Actor', np.mean(actor_losses), rollout_idx)
+    writer.add_scalar('Loss/Critic', np.mean(critic_losses), rollout_idx)
+
+
 def train(cfg: DictConfig):
     run_name = cfg.run_name or f"run_{time.strftime('%Y%m%d_%H%M%S')}"
     output_dir = to_absolute_path(cfg.output_dir)
@@ -241,246 +426,21 @@ def train(cfg: DictConfig):
         print(f"[INFO] Loading critic weights from {critic_path}")
         critic.load_state_dict(torch.load(critic_path, map_location=device))
 
-    gamma = cfg.train.gamma
-    lam = cfg.train.gae_lambda
-    rollout_steps = cfg.train.rollout_steps
-    ppo_epochs = cfg.train.ppo_epochs
-    minibatch_size = cfg.train.minibatch_size
-    clip_eps = cfg.train.clip_eps
 
-    num_envs = cfg.env.num_envs
-    # Vectorized env with switch
-    obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
 
     num_rollouts = cfg.train.num_rollouts
-    rollout_steps = cfg.train.rollout_steps
-    # Curriculum from config
-    curriculum = cfg.env.curriculum
     for rollout_idx in range(start_rollout_idx, num_rollouts + 1):
-        # === Curriculum learning: select env difficulty from config ===
-        if curriculum:
-            for stage in curriculum:
-                if rollout_idx <= stage['until_rollout']:
-                    min_start_goal_dist = stage['min_start_goal_dist']
-                    max_start_goal_dist = stage['max_start_goal_dist']
-                    hitwall_cost = stage['hitwall_cost']
-                    break
-        else:
-            raise RuntimeError('No curriculum defined in config!')
-        # Create envs for this rollout with correct curriculum params
-        env_fns = [
-            make_env(cfg, run_dir, episode_offset=i,
-                     min_start_goal_dist=min_start_goal_dist,
-                     max_start_goal_dist=max_start_goal_dist,
-                     hitwall_cost=hitwall_cost)
-            for i in range(num_envs)
-        ]
-        if cfg.env.vector_type == 'async':
-            VecEnvClass = AsyncVectorEnv
-        elif cfg.env.vector_type == 'sync':
-            VecEnvClass = SyncVectorEnv
-        else:
-            raise ValueError(f"Unknown vector type: {cfg.env.vector_type}")
-        envs = VecEnvClass(env_fns)
         rollout_start_time = time.time()
-        print(f"[INFO] Rollout {rollout_idx}: Start recording transitions... (min/max dist: {min_start_goal_dist}-{max_start_goal_dist}, hitwall: {hitwall_cost})")
-        buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape)
-        record_start_time = time.time()
-        # --- Video recording for the whole rollout ---
-        render_this_rollout = (cfg.env.render_every > 0
-                               and rollout_idx % cfg.env.render_every == 0
-                               or rollout_idx == 1)
-        video_frames = None
-        if render_this_rollout:
-            video_frames = [[] for _ in range(cfg.env.num_envs)]
-        # video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}.mp4")  # Remove old single-env path
-        next_obs, _ = envs.reset()
-        next_obs = torch.as_tensor(next_obs,
-                                   device=device,
-                                   dtype=torch.float32)
-        is_next_terminal = np.zeros(num_envs, dtype=bool)
-        episode_rewards = [[] for _ in range(num_envs)]
-        cur_episode_rewards = [[] for _ in range(num_envs)]
-        gamma_pow = np.ones(num_envs, dtype=np.float32)
-        gamma = cfg.train.gamma
-        t_infer = t_env = t_render = t_cv = t_buffer = t_append = 0.0
-
-        # Visualize distance map for each env at the start of training
-        if False:
-            for i in range(num_envs):
-                # envs.envs[i] is the underlying DrivingEnv instance
-                env = envs.envs[i]
-                env.visualize_distance_map(
-                    filename=f'distance_map_rollout{rollout_idx}_env{i}.png')
-
-        # --- Success/failure counting (integer counters) ---
-        success_count = 0
-        failure_count = 0
-        for step in range(rollout_steps):
-            cur_obs = next_obs
-            is_current_terminal = is_next_terminal.copy()
-            t0 = time.time()
-            with torch.no_grad():
-                dist = actor(cur_obs)
-                action = dist.sample()
-                logprob = dist.log_prob(action)
-                value = critic(cur_obs).squeeze(-1)
-            t_infer += time.time() - t0
-
-            t0 = time.time()
-            next_obs, reward, terminated, truncated, infos = envs.step(
-                action.cpu().numpy())
-            next_obs = torch.as_tensor(next_obs,
-                                       device=device,
-                                       dtype=torch.float32)
-            t_env += time.time() - t0
-
-            if render_this_rollout:
-                t0 = time.time()
-                # Record video for all envs
-                for env_id in cfg.env.render_env_ids:
-                    info_env = {key: infos[key][env_id] for key in infos}
-                    env_vel = infos['vel'][env_id]
-                    frame = get_human_frame(obs=cur_obs[env_id].cpu().numpy(),
-                                            vel=env_vel,
-                                            v_max=cfg.env.v_max,
-                                            action=action[env_id],
-                                            info=info_env,
-                                            a_max=cfg.env.a_max)
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    video_frames[env_id].append(frame_rgb)
-                t_render += time.time() - t0
-
-            t0 = time.time()
-            # Add batched data to buffer
-            buffer.add(cur_obs, action, torch.as_tensor(reward, device=device),
-                       torch.as_tensor(is_current_terminal, device=device),
-                       logprob, value)
-            t_buffer += time.time() - t0
-
-            is_next_terminal = np.logical_or(terminated, truncated)
-            for i in range(num_envs):
-                # Only update if current step is not a placeholder (not terminal)
-                if not is_current_terminal[i]:
-                    cur_episode_rewards[i].append(reward[i] * gamma_pow[i])
-                    gamma_pow[i] *= gamma
-                if is_next_terminal[i]:
-                    if len(cur_episode_rewards[i]) > 0:
-                        episode_rewards[i].append(sum(cur_episode_rewards[i]))
-                    cur_episode_rewards[i] = []
-                    gamma_pow[i] = 1.0
-                    # --- Count success/failure at episode end ---
-                    if terminated[i]:
-                        if infos['success'][i]:
-                            success_count += 1
-                        else:
-                            failure_count += 1
-        with torch.no_grad():
-            next_value = critic(next_obs).squeeze(-1)
-        # --- Save video for this rollout ---
-        if render_this_rollout:
-            for env_id in cfg.env.render_env_ids:
-                video_path = os.path.join(
-                    run_dir, f"rollout_{rollout_idx:05d}_env{env_id}.mp4")
-                imageio.mimsave(video_path,
-                                video_frames[env_id],
-                                fps=cfg.env.video_fps,
-                                codec='libx264')
-        record_time = time.time() - record_start_time
-        # Log record time to TensorBoard
-        writer.add_scalar('Time/Record', record_time, rollout_idx)
-        print(
-            f"[INFO] Rollout {rollout_idx}: Record took {record_time:.3f} s.")
-        print(
-            f"[TIMER] Rollout {rollout_idx}: infer={t_infer:.3f}s, env={t_env:.3f}s, render={t_render:.3f}s, cvtColor={t_cv:.3f}s, buffer={t_buffer:.3f}s, append={t_append:.3f}s"
-        )
+        # --- Collect rollout (now includes env creation, logging, and video saving) ---
+        buffer, is_next_terminal, next_value = collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic)
         update_start_time = time.time()
-        # Compute GAE and returns
-        obs_raw, act_raw, rew_raw, terminal_raw, logp_raw, val_raw = buffer.get_raw()
-        del buffer
-        adv_buf, ret_buf = compute_gae(
-            rew_raw, val_raw, terminal_raw, gamma, lam,
-            next_value.cpu(),
-            torch.as_tensor(is_next_terminal, device='cpu', dtype=torch.float32))
-        # Flatten for training
-        is_valid_buf = (terminal_raw == 0).reshape(-1)
-        obs_buf = obs_raw.reshape(-1, *obs_raw.shape[2:])[is_valid_buf]
-        act_buf = act_raw.reshape(-1)[is_valid_buf]
-        logp_buf = logp_raw.reshape(-1)[is_valid_buf]
-        adv_buf = adv_buf.reshape(-1)[is_valid_buf]
-        ret_buf = ret_buf.reshape(-1)[is_valid_buf]
+        print(f"[INFO] Rollout {rollout_idx}: Record took {update_start_time - rollout_start_time:.3f} s.")
 
-        # Move to GPU for PPO update
-        obs_buf = obs_buf.to(device)
-        act_buf = act_buf.to(device)
-        logp_buf = logp_buf.to(device)
-        adv_buf = adv_buf.to(device)
-        ret_buf = ret_buf.to(device)
-
-        adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
-        # PPO update
-        inds = torch.randperm(adv_buf.shape[0], device=device)
-        actor_losses = []
-        critic_losses = []
-        for _ in range(ppo_epochs):
-            for start in range(0, adv_buf.shape[0], minibatch_size):
-                mb_inds = inds[start:start + minibatch_size]
-                mb_obs = obs_buf[mb_inds]
-                mb_act = act_buf[mb_inds]
-                mb_adv = adv_buf[mb_inds]
-                mb_ret = ret_buf[mb_inds]
-                mb_logp_old = logp_buf[mb_inds]
-                # Actor update
-                with autocast(device_type='cuda', enabled=use_fp16):
-                    dist = actor(mb_obs)
-                    logp = dist.log_prob(mb_act)
-                    ratio = (logp - mb_logp_old).exp()
-                    surr1 = ratio * mb_adv
-                    surr2 = torch.clamp(ratio, 1.0 - clip_eps,
-                                        1.0 + clip_eps) * mb_adv
-                    loss_pi = -torch.min(surr1, surr2).mean()
-                opt_actor.zero_grad()
-                if use_fp16:
-                    scaler.scale(loss_pi).backward()
-                    scaler.step(opt_actor)
-                    scaler.update()
-                else:
-                    loss_pi.backward()
-                    opt_actor.step()
-                actor_losses.append(loss_pi.item())
-                # Critic update
-                with autocast(device_type='cuda', enabled=use_fp16):
-                    value = critic(mb_obs).squeeze(-1)
-                    loss_v = F.mse_loss(value, mb_ret)
-                opt_critic.zero_grad()
-                if use_fp16:
-                    scaler.scale(loss_v).backward()
-                    scaler.step(opt_critic)
-                    scaler.update()
-                else:
-                    loss_v.backward()
-                    opt_critic.step()
-                critic_losses.append(loss_v.item())
-        # Log losses
-        writer.add_scalar('Loss/Actor', np.mean(actor_losses), rollout_idx)
-        writer.add_scalar('Loss/Critic', np.mean(critic_losses), rollout_idx)
-        # Log average discounted episode reward (only for complete episodes)
-        flat_episode_rewards = [
-            r for sublist in episode_rewards for r in sublist
-        ]
-        if flat_episode_rewards:
-            avg_discounted_reward = np.mean(flat_episode_rewards)
-            writer.add_scalar('Reward/AvgDiscountedEpisode',
-                              avg_discounted_reward, rollout_idx)
-        avg_successes_per_env = success_count / num_envs
-        avg_failures_per_env = failure_count / num_envs
-        writer.add_scalar('Reward/AvgSuccess', np.mean(avg_successes_per_env),
-                          rollout_idx)
-        writer.add_scalar('Reward/AvgFailure', np.mean(avg_failures_per_env),
-                          rollout_idx)
+        writer.add_scalar('Time/Record', update_start_time - rollout_start_time, rollout_idx)
+        # --- PPO update ---
+        ppo_update(buffer, critic, actor, cfg, device, is_next_terminal, next_value, scaler, use_fp16, writer, rollout_idx, opt_actor, opt_critic)
         update_time = time.time() - update_start_time
         rollout_time = time.time() - rollout_start_time
-        # Log update and total rollout time to TensorBoard
         writer.add_scalar('Time/Update', update_time, rollout_idx)
         writer.add_scalar('Time/Rollout', rollout_time, rollout_idx)
         print(
