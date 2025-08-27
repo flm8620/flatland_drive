@@ -1,0 +1,32 @@
+name: land
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - ffmpeg
+  - pip
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu124
+
+    - torch==2.6.0+cu124
+    - torchvision==0.21.0+cu124
+    - torchaudio==2.6.0+cu124
+
+    - numpy>=2.0
+    - tqdm
+    - matplotlib
+    - opencv-python
+    - pynvml
+    - psutil
+    - tensorboard
+    - einops
+    - roma
+    - hydra-core
+    - "imageio[ffmpeg]"
+    - scikit-image
+    - scikit-learn
+
+    - stable-baselines3
+    - "gymnasium[other,classic-control]"
