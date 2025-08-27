@@ -25,8 +25,8 @@ The network should only take the current BEV image as input, together with curre
 '''
 
 import os
+import glob
 import numpy as np
-import math
 import cv2
 import torch
 import torch.nn as nn
@@ -183,7 +183,7 @@ def make_env(cfg, run_dir, episode_offset=0, min_start_goal_dist=None, max_start
 
 
 
-def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic):
+def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     """
     Handles curriculum, creates envs, collects a rollout, logs stats, saves video, and returns only the buffer and next_value needed for PPO update.
     """
@@ -284,7 +284,6 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic):
         next_value = critic(next_obs).squeeze(-1)
     # --- Logging and video saving here ---
     flat_episode_rewards = [r for sublist in episode_rewards for r in sublist]
-    writer = SummaryWriter(log_dir=run_dir)
     print(f"[TIMER] Rollout {rollout_idx}: infer={t_infer:.3f}s, env={t_env:.3f}s, render={t_render:.3f}s, cvtColor={t_cv:.3f}s, buffer={t_buffer:.3f}s, append={t_append:.3f}s")
     if flat_episode_rewards:
         avg_discounted_reward = np.mean(flat_episode_rewards)
@@ -387,7 +386,6 @@ def train(cfg: DictConfig):
     # === Resume logic ===
     start_rollout_idx = 1
     if cfg.train.resume:
-        import glob
         # Find latest actor and critic files
         actor_files = sorted(glob.glob(os.path.join(run_dir, 'actor_ep*.pth')))
         critic_files = sorted(
@@ -395,7 +393,7 @@ def train(cfg: DictConfig):
         if actor_files and critic_files:
             # Get the highest episode number (use only the filename part)
             def extract_ep(fname):
-                import re, os
+                import re
                 base = os.path.basename(fname)
                 m = re.search(r'ep(\d+)', base)
                 return int(m.group(1)) if m else -1
@@ -432,7 +430,7 @@ def train(cfg: DictConfig):
     for rollout_idx in range(start_rollout_idx, num_rollouts + 1):
         rollout_start_time = time.time()
         # --- Collect rollout (now includes env creation, logging, and video saving) ---
-        buffer, is_next_terminal, next_value = collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic)
+        buffer, is_next_terminal, next_value = collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer)
         update_start_time = time.time()
         print(f"[INFO] Rollout {rollout_idx}: Record took {update_start_time - rollout_start_time:.3f} s.")
 
