@@ -115,8 +115,6 @@ class DrivingEnv(gym.Env):
             self.cost_map[drivable] = 0.0
             self.cost_map[~drivable] = 1.0
 
-            drivable = self.cost_map == 0
-
             # 3) Enforce minimum width by eroding drivable mask
             kernel_size = 2 * corridor_width + 1
             se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,

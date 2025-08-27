@@ -39,6 +39,7 @@ import hydra
 from hydra.utils import to_absolute_path
 from torch.utils.tensorboard import SummaryWriter
 import imageio.v2 as imageio
+import gymnasium as gym
 from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
 from torch.amp import autocast, GradScaler
 
@@ -215,7 +216,10 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
         VecEnvClass = SyncVectorEnv
     else:
         raise ValueError(f"Unknown vector type: {cfg.env.vector_type}")
-    envs = VecEnvClass(env_fns)
+    envs = VecEnvClass(
+        env_fns, 
+        autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP, # yes, this is important, be careful about your RL's convention
+    )
     print(f"[INFO] Rollout {rollout_idx}: Start recording transitions... (min/max dist: {min_start_goal_dist}-{max_start_goal_dist}, hitwall: {hitwall_cost})")
     buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape)
     gamma = cfg.train.gamma
