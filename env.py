@@ -162,9 +162,9 @@ class DrivingEnv(gym.Env):
             self.start = np.array([sx, sy], dtype=np.int32)
             self.target = np.array([tx, ty], dtype=np.int32)
             elapsed = time.time() - start_time
-            print(
-                f"[DrivingEnv] Map generated in {elapsed:.3f} seconds. Start-goal dist: {dists[sy, sx]:.1f}"
-            )
+            # print(
+            #     f"[DrivingEnv] Map generated in {elapsed:.3f} seconds. Start-goal dist: {dists[sy, sx]:.1f}"
+            # )
             # Compute geodesic distance map after map generation
             self._compute_geodesic_distance_map()
             break
