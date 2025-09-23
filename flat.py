@@ -33,17 +33,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import time
+from tqdm import tqdm
+import multiprocessing
 # Hydra and TensorBoard imports
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from hydra.utils import to_absolute_path
 from torch.utils.tensorboard import SummaryWriter
 import imageio.v2 as imageio
-import gymnasium as gym
-from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
 from torch.amp import autocast, GradScaler
 
-from env import DrivingEnv, get_human_frame
+# Set multiprocessing start method to 'spawn' for CUDA compatibility
+multiprocessing.set_start_method('spawn', force=True)
+
+
+from env import ParallelDrivingEnv, get_human_frame
 from networks import ViTEncoder, ConvEncoder
 
 
@@ -111,82 +115,71 @@ class RolloutBuffer:
         self.obs = torch.zeros((n_steps, n_envs, *obs_shape), dtype=torch.float32, device='cpu')
         self.actions = torch.zeros((n_steps, n_envs), dtype=torch.long, device='cpu')
         self.rewards = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
-        self.is_terminals = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
+        self.is_terminated = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
+        self.is_truncated = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
         self.logprobs = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
         self.values = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
+        self.final_values = None
+        self.final_is_terminated = None
+        self.final_is_truncated = None
 
-    def add(self, obs, action, reward, is_terminal, logprob, value):
+    def add(self, obs, action, reward, is_terminated, is_truncated, logprob, value):
         self.obs[self.ptr].copy_(obs.cpu())
         self.actions[self.ptr].copy_(action.cpu())
         self.rewards[self.ptr].copy_(reward.cpu())
-        self.is_terminals[self.ptr].copy_(is_terminal.cpu())
+        self.is_terminated[self.ptr].copy_(is_terminated.cpu())
+        self.is_truncated[self.ptr].copy_(is_truncated.cpu())
         self.logprobs[self.ptr].copy_(logprob.cpu())
         self.values[self.ptr].copy_(value.cpu())
         self.ptr += 1
         if self.ptr >= self.n_steps:
             self.full = True
 
-    def get_raw(self):
+    def add_final_step_info(self, final_values, final_is_terminated, final_is_truncated):
         assert self.full, "Buffer not full yet!"
-        return self.obs, self.actions, self.rewards, self.is_terminals, self.logprobs, self.values
+        self.final_values = final_values.cpu()
+        self.final_is_terminated = final_is_terminated.float().cpu()
+        self.final_is_truncated = final_is_truncated.float().cpu()
 
     def reset(self):
         self.ptr = 0
         self.full = False
 
 
-def compute_gae(rewards, values, is_terminals, gamma, lam, the_extra_value,
-                is_next_terminal):
+def compute_gae(buffer, gamma, lam):
+    rewards = buffer.rewards
+    terminated = buffer.is_terminated
+    truncated = buffer.is_truncated
+    values = buffer.values
+    
     # rewards, values, is_terminals: (n_steps, n_envs)
     # the_extra_value: (n_envs,)
     # is_next_terminal: (n_envs,)
     n_steps, n_envs = rewards.shape
     adv = torch.zeros_like(rewards)
     lastgaelam = torch.zeros(n_envs, device=rewards.device)
+    done = (terminated.bool() | truncated.bool()).float()
     for t in reversed(range(n_steps)):
         if t == n_steps - 1:
-            episode_continues = 1.0 - is_next_terminal
-            next_value = the_extra_value
+            need_next_value = 1.0 - buffer.final_is_terminated
+            next_value = buffer.final_values
+            step_continues = torch.zeros(n_envs, device=rewards.device)
         else:
-            episode_continues = 1.0 - is_terminals[t + 1]
+            need_next_value = 1.0 - terminated[t + 1]
             next_value = values[t + 1]
-        delta = rewards[t] + gamma * next_value * episode_continues - values[t]
-        lastgaelam = delta + gamma * lam * episode_continues * lastgaelam
+            step_continues = 1.0 - done[t + 1]
+
+        delta = rewards[t] + gamma * next_value * need_next_value - values[t]
+        lastgaelam = delta + gamma * lam * step_continues * lastgaelam
         adv[t] = lastgaelam
     returns = adv + values
-    return adv, returns
-
-
-def make_env(cfg, run_dir, episode_offset=0, min_start_goal_dist=None, max_start_goal_dist=None, hitwall_cost=None):
-    env_seed = int(time.time() * 1e6) % (2**32 - 1) + episode_offset * 10000
-
-    def _thunk():
-        return DrivingEnv(render_dir=run_dir,
-                          view_size=cfg.env.view_size,
-                          dt=cfg.env.dt,
-                          a_max=cfg.env.a_max,
-                          v_max=cfg.env.v_max,
-                          w_col=cfg.env.w_col,
-                          R_goal=cfg.env.R_goal,
-                          disk_radius=cfg.env.disk_radius,
-                          video_fps=cfg.env.video_fps,
-                          w_dist=cfg.env.w_dist,
-                          w_accel=cfg.env.w_accel,
-                          max_steps=cfg.train.max_steps,
-                          hitwall_cost=hitwall_cost,
-                          pyramid_scales=cfg.env.pyramid_scales,
-                          num_levels=cfg.env.num_levels,
-                          min_start_goal_dist=min_start_goal_dist,
-                          max_start_goal_dist=max_start_goal_dist,
-                          seed=env_seed)
-
-    return _thunk
-
+    valid_mask = ~done.bool()
+    return adv, returns, valid_mask
 
 
 def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     """
-    Handles curriculum, creates envs, collects a rollout, logs stats, saves video, and returns only the buffer and next_value needed for PPO update.
+    Handles curriculum, creates parallel envs, collects a rollout, logs stats, saves video, and returns only the buffer and next_value needed for PPO update.
     """
     # === Curriculum learning: select env difficulty from config ===
     curriculum = cfg.env.curriculum
@@ -194,6 +187,7 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     num_levels = cfg.env.num_levels
     rollout_steps = cfg.train.rollout_steps
     obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
+    
     if curriculum:
         for stage in curriculum:
             if rollout_idx <= stage['until_rollout']:
@@ -203,23 +197,30 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
                 break
     else:
         raise RuntimeError('No curriculum defined in config!')
-    env_fns = [
-        make_env(cfg, run_dir, episode_offset=i,
-                 min_start_goal_dist=min_start_goal_dist,
-                 max_start_goal_dist=max_start_goal_dist,
-                 hitwall_cost=hitwall_cost)
-        for i in range(num_envs)
-    ]
-    if cfg.env.vector_type == 'async':
-        VecEnvClass = AsyncVectorEnv
-    elif cfg.env.vector_type == 'sync':
-        VecEnvClass = SyncVectorEnv
-    else:
-        raise ValueError(f"Unknown vector type: {cfg.env.vector_type}")
-    envs = VecEnvClass(
-        env_fns, 
-        autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP, # yes, this is important, be careful about your RL's convention
+    
+    # Create parallel environment
+    env = ParallelDrivingEnv(
+        num_envs=num_envs,
+        view_size=cfg.env.view_size,
+        dt=cfg.env.dt,
+        a_max=cfg.env.a_max,
+        v_max=cfg.env.v_max,
+        w_col=cfg.env.w_col,
+        R_goal=cfg.env.R_goal,
+        disk_radius=cfg.env.disk_radius,
+        render_dir=run_dir,
+        video_fps=cfg.env.video_fps,
+        w_dist=cfg.env.w_dist,
+        w_accel=cfg.env.w_accel,
+        max_steps=cfg.train.max_steps,
+        hitwall_cost=hitwall_cost,
+        pyramid_levels=cfg.env.pyramid_levels,
+        num_levels=cfg.env.num_levels,
+        min_start_goal_dist=min_start_goal_dist,
+        max_start_goal_dist=max_start_goal_dist,
+        device=device
     )
+    
     print(f"[INFO] Rollout {rollout_idx}: Start recording transitions... (min/max dist: {min_start_goal_dist}-{max_start_goal_dist}, hitwall: {hitwall_cost})")
     buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape)
     gamma = cfg.train.gamma
@@ -227,18 +228,22 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     video_frames = None
     if render_this_rollout:
         video_frames = [[] for _ in range(cfg.env.num_envs)]
-    next_obs, _ = envs.reset()
-    next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float32)
-    is_next_terminal = np.zeros(num_envs, dtype=bool)
-    episode_rewards = [[] for _ in range(num_envs)]
+    
+    next_obs, _ = env.reset()
+    next_obs = next_obs.to(device)  # Already on GPU from parallel env
+    is_next_terminated = torch.zeros(num_envs, dtype=torch.bool)
+    is_next_truncated = torch.zeros(num_envs, dtype=torch.bool)
+    episode_rewards = []
     cur_episode_rewards = [[] for _ in range(num_envs)]
     gamma_pow = np.ones(num_envs, dtype=np.float32)
     t_infer = t_env = t_render = t_cv = t_buffer = t_append = 0.0
     success_count = 0
     failure_count = 0
-    for step in range(rollout_steps):
+    
+    for step in tqdm(range(rollout_steps), desc=f"Rollout {rollout_idx} steps", smoothing=0.01):
         cur_obs = next_obs
-        is_current_terminal = is_next_terminal.copy()
+        is_current_terminated = is_next_terminated.clone()
+        is_current_truncated = is_next_truncated.clone()
         t0 = time.time()
         with torch.no_grad():
             dist = actor(cur_obs)
@@ -247,50 +252,70 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
             value = critic(cur_obs).squeeze(-1)
         t_infer += time.time() - t0
         t0 = time.time()
-        next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
-        next_obs = torch.as_tensor(next_obs, device=device, dtype=torch.float32)
+        next_obs, reward, terminated, truncated, infos = env.step(action)
         t_env += time.time() - t0
+        
         if render_this_rollout:
             t0 = time.time()
             for env_id in cfg.env.render_env_ids:
-                info_env = {key: infos[key][env_id] for key in infos}
-                env_vel = infos['vel'][env_id]
-                frame = get_human_frame(obs=cur_obs[env_id].cpu().numpy(),
-                                        vel=env_vel,
+                # Convert tensors to numpy for rendering
+                obs_np = cur_obs[env_id].cpu().numpy()
+                vel_np = infos['vel'][env_id].cpu().numpy()
+                action_item = action[env_id]
+                
+                # Extract info for this environment
+                info_env = {
+                    'r_progress': infos['r_progress'][env_id].item(),
+                    'r_goal': infos['r_goal'][env_id].item(),
+                    'hitwall': infos['hitwall'][env_id].item(),
+                }
+                
+                frame = get_human_frame(obs=obs_np,
+                                        vel=vel_np,
                                         v_max=cfg.env.v_max,
-                                        action=action[env_id],
+                                        action=action_item,
                                         info=info_env,
                                         a_max=cfg.env.a_max)
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 video_frames[env_id].append(frame_rgb)
             t_render += time.time() - t0
+        
         t0 = time.time()
-        buffer.add(cur_obs, action, torch.as_tensor(reward, device=device),
-                   torch.as_tensor(is_current_terminal, device=device),
+        buffer.add(cur_obs, action, reward,
+                   is_current_terminated,
+                   is_current_truncated,
                    logprob, value)
         t_buffer += time.time() - t0
-        is_next_terminal = np.logical_or(terminated, truncated)
+        
+        is_next_terminated = terminated
+        is_next_truncated = truncated
+        
         for i in range(num_envs):
-            if not is_current_terminal[i]:
-                cur_episode_rewards[i].append(reward[i] * gamma_pow[i])
+            current_done = is_next_terminated[i] or is_next_truncated[i]
+            if not current_done:
+                cur_episode_rewards[i].append(reward[i].item() * gamma_pow[i])
                 gamma_pow[i] *= gamma
-            if is_next_terminal[i]:
+
+            next_done = is_next_terminated[i] or is_next_truncated[i]
+            if next_done:
                 if len(cur_episode_rewards[i]) > 0:
-                    episode_rewards[i].append(sum(cur_episode_rewards[i]))
+                    episode_rewards.append(sum(cur_episode_rewards[i]))
                 cur_episode_rewards[i] = []
                 gamma_pow[i] = 1.0
-                if terminated[i]:
-                    if infos['success'][i]:
+                if is_next_terminated[i]:
+                    if infos['success'][i].item():
                         success_count += 1
                     else:
                         failure_count += 1
+    
     with torch.no_grad():
         next_value = critic(next_obs).squeeze(-1)
-    # --- Logging and video saving here ---
-    flat_episode_rewards = [r for sublist in episode_rewards for r in sublist]
+    buffer.add_final_step_info(next_value, is_next_terminated, is_next_truncated)
+
+    # --- Logging and video saving ---
     print(f"[TIMER] Rollout {rollout_idx}: infer={t_infer:.3f}s, env={t_env:.3f}s, render={t_render:.3f}s, cvtColor={t_cv:.3f}s, buffer={t_buffer:.3f}s, append={t_append:.3f}s")
-    if flat_episode_rewards:
-        avg_discounted_reward = np.mean(flat_episode_rewards)
+    if episode_rewards:
+        avg_discounted_reward = np.mean(episode_rewards)
         writer.add_scalar('Reward/AvgDiscountedEpisode', avg_discounted_reward, rollout_idx)
     avg_successes_per_env = success_count / num_envs
     avg_failures_per_env = failure_count / num_envs
@@ -300,27 +325,36 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
         for env_id in cfg.env.render_env_ids:
             video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}_env{env_id}.mp4")
             imageio.mimsave(video_path, video_frames[env_id], fps=cfg.env.video_fps, codec='libx264')
-    # Only return what is needed for PPO update
-    return buffer, is_next_terminal, next_value
+    
+    return buffer
 
+def process_buffer(buffer, gamma, lam):
+    obs_raw = buffer.obs
+    act_raw = buffer.actions
+    logp_raw = buffer.logprobs
 
-def ppo_update(buffer, critic, actor, cfg, device, is_next_terminal, next_value, scaler, use_fp16, writer, rollout_idx, opt_actor, opt_critic):
-    gamma = cfg.train.gamma
-    lam = cfg.train.gae_lambda
-    ppo_epochs = cfg.train.ppo_epochs
-    minibatch_size = cfg.train.minibatch_size
-    clip_eps = cfg.train.clip_eps
-    obs_raw, act_raw, rew_raw, terminal_raw, logp_raw, val_raw = buffer.get_raw()
-    adv_buf, ret_buf = compute_gae(
-        rew_raw, val_raw, terminal_raw, gamma, lam,
-        next_value.cpu(),
-        torch.as_tensor(is_next_terminal, device='cpu', dtype=torch.float32))
-    is_valid_buf = (terminal_raw == 0).reshape(-1)
+    adv_buf, ret_buf, is_valid_buf = compute_gae(buffer, gamma, lam)
+
+    is_valid_buf = is_valid_buf.reshape(-1)
+
     obs_buf = obs_raw.reshape(-1, *obs_raw.shape[2:])[is_valid_buf]
     act_buf = act_raw.reshape(-1)[is_valid_buf]
     logp_buf = logp_raw.reshape(-1)[is_valid_buf]
     adv_buf = adv_buf.reshape(-1)[is_valid_buf]
     ret_buf = ret_buf.reshape(-1)[is_valid_buf]
+
+    return obs_buf, act_buf, logp_buf, adv_buf, ret_buf
+
+
+def ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rollout_idx, opt_actor, opt_critic):
+    gamma = cfg.train.gamma
+    lam = cfg.train.gae_lambda
+    ppo_epochs = cfg.train.ppo_epochs
+    minibatch_size = cfg.train.minibatch_size
+    clip_eps = cfg.train.clip_eps
+
+    obs_buf, act_buf, logp_buf, adv_buf, ret_buf = process_buffer(buffer, gamma, lam)
+
     obs_buf = obs_buf.to(device)
     act_buf = act_buf.to(device)
     logp_buf = logp_buf.to(device)
@@ -331,7 +365,7 @@ def ppo_update(buffer, critic, actor, cfg, device, is_next_terminal, next_value,
     actor_losses = []
     critic_losses = []
     for _ in range(ppo_epochs):
-        for start in range(0, adv_buf.shape[0], minibatch_size):
+        for start in tqdm(range(0, adv_buf.shape[0], minibatch_size), desc="PPO minibatches"):
             mb_inds = inds[start:start + minibatch_size]
             mb_obs = obs_buf[mb_inds]
             mb_act = act_buf[mb_inds]
@@ -434,13 +468,13 @@ def train(cfg: DictConfig):
     for rollout_idx in range(start_rollout_idx, num_rollouts + 1):
         rollout_start_time = time.time()
         # --- Collect rollout (now includes env creation, logging, and video saving) ---
-        buffer, is_next_terminal, next_value = collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer)
+        buffer = collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer)
         update_start_time = time.time()
         print(f"[INFO] Rollout {rollout_idx}: Record took {update_start_time - rollout_start_time:.3f} s.")
 
         writer.add_scalar('Time/Record', update_start_time - rollout_start_time, rollout_idx)
         # --- PPO update ---
-        ppo_update(buffer, critic, actor, cfg, device, is_next_terminal, next_value, scaler, use_fp16, writer, rollout_idx, opt_actor, opt_critic)
+        ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rollout_idx, opt_actor, opt_critic)
         update_time = time.time() - update_start_time
         rollout_time = time.time() - rollout_start_time
         writer.add_scalar('Time/Update', update_time, rollout_idx)
