@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from numba import jit, types
 from numba.typed import List
+from timer import get_timer
 
 
 @jit(nopython=True, cache=True)
@@ -337,7 +338,8 @@ class ParallelDrivingEnv:
         # we use NEXT_STEP autoreset convention in gymnasium
         reset_env_ids = self.dones.nonzero(as_tuple=True)[0].tolist()
 
-        self._reset(reset_env_ids)
+        with get_timer("reset"):
+            self._reset(reset_env_ids)
 
         self.step_counts[reset_env_ids] = 0
         self.step_counts += 1
@@ -431,20 +433,8 @@ class ParallelDrivingEnv:
         self.prev_dist_to_goals[activate_mask] = geodesic_dists[activate_mask]
         
         # Generate observations (always next step observation due to auto-reset)
-        obs = self._get_obs()
-
-        # check if rewards has any non normal float number
-        if not torch.isfinite(rewards).all():
-            print("Non-finite rewards detected!")
-            print("Rewards:", rewards)
-            print("Positions:", self.pos)
-            print("Velocities:", self.vel)
-            print("Actions:", actions)
-            raise ValueError("Non-finite rewards detected!")
-        
-        if not torch.isfinite(obs).all():
-            print("Non-finite observations detected!")
-            raise ValueError("Non-finite observations detected!")
+        with get_timer("get_obs"):
+            obs = self._get_obs()
         
         # Create info dict
         info = {

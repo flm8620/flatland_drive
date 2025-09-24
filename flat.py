@@ -49,7 +49,7 @@ multiprocessing.set_start_method('spawn', force=True)
 
 from env import ParallelDrivingEnv, get_human_frame
 from networks import ViTEncoder, ConvEncoder
-from timer import get_timer, set_timing_enabled, print_timing_report
+from timer import get_timer, set_timing_enabled, reset_timer, print_timing_report
 
 
 def make_encoder(cfg, view_size, num_levels):
@@ -237,7 +237,6 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     episode_rewards = []
     cur_episode_rewards = [[] for _ in range(num_envs)]
     gamma_pow = np.ones(num_envs, dtype=np.float32)
-    t_infer = t_env = t_render = t_cv = t_buffer = t_append = 0.0
     success_count = 0
     failure_count = 0
     
@@ -245,48 +244,45 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
         cur_obs = next_obs
         is_current_terminated = is_next_terminated.clone()
         is_current_truncated = is_next_truncated.clone()
-        t0 = time.time()
-        with torch.no_grad():
-            dist = actor(cur_obs)
-            action = dist.sample()
-            logprob = dist.log_prob(action)
-            value = critic(cur_obs).squeeze(-1)
-        t_infer += time.time() - t0
-        t0 = time.time()
-        next_obs, reward, terminated, truncated, infos = env.step(action)
-        t_env += time.time() - t0
+
+        with get_timer("inference"):
+            with torch.no_grad():
+                dist = actor(cur_obs)
+                action = dist.sample()
+                logprob = dist.log_prob(action)
+                value = critic(cur_obs).squeeze(-1)
+
+        with get_timer("step"):
+            next_obs, reward, terminated, truncated, infos = env.step(action)
         
         if render_this_rollout:
-            t0 = time.time()
-            for env_id in cfg.env.render_env_ids:
-                # Convert tensors to numpy for rendering
-                obs_np = cur_obs[env_id].cpu().numpy()
-                vel_np = infos['vel'][env_id].cpu().numpy()
-                action_item = action[env_id]
-                
-                # Extract info for this environment
-                info_env = {
-                    'r_progress': infos['r_progress'][env_id].item(),
-                    'r_goal': infos['r_goal'][env_id].item(),
-                    'hitwall': infos['hitwall'][env_id].item(),
-                }
-                
-                frame = get_human_frame(obs=obs_np,
-                                        vel=vel_np,
-                                        v_max=cfg.env.v_max,
-                                        action=action_item,
-                                        info=info_env,
-                                        a_max=cfg.env.a_max)
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                video_frames[env_id].append(frame_rgb)
-            t_render += time.time() - t0
+            with get_timer("render"):
+                for env_id in cfg.env.render_env_ids:
+                    # Convert tensors to numpy for rendering
+                    obs_np = cur_obs[env_id].cpu().numpy()
+                    vel_np = infos['vel'][env_id].cpu().numpy()
+                    action_item = action[env_id]
+                    
+                    # Extract info for this environment
+                    info_env = {
+                        'r_progress': infos['r_progress'][env_id].item(),
+                        'r_goal': infos['r_goal'][env_id].item(),
+                        'hitwall': infos['hitwall'][env_id].item(),
+                    }
+                    
+                    frame = get_human_frame(obs=obs_np,
+                                            vel=vel_np,
+                                            v_max=cfg.env.v_max,
+                                            action=action_item,
+                                            info=info_env,
+                                            a_max=cfg.env.a_max)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    video_frames[env_id].append(frame_rgb)
         
-        t0 = time.time()
         buffer.add(cur_obs, action, reward,
                    is_current_terminated,
                    is_current_truncated,
                    logprob, value)
-        t_buffer += time.time() - t0
         
         is_next_terminated = terminated
         is_next_truncated = truncated
@@ -313,8 +309,6 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
         next_value = critic(next_obs).squeeze(-1)
     buffer.add_final_step_info(next_value, is_next_terminated, is_next_truncated)
 
-    # --- Logging and video saving ---
-    print(f"[TIMER] Rollout {rollout_idx}: infer={t_infer:.3f}s, env={t_env:.3f}s, render={t_render:.3f}s, cvtColor={t_cv:.3f}s, buffer={t_buffer:.3f}s, append={t_append:.3f}s")
     if episode_rewards:
         avg_discounted_reward = np.mean(episode_rewards)
         writer.add_scalar('Reward/AvgDiscountedEpisode', avg_discounted_reward, rollout_idx)
@@ -501,6 +495,8 @@ def train(cfg: DictConfig):
 
     num_rollouts = cfg.train.num_rollouts
     for rollout_idx in range(start_rollout_idx, num_rollouts + 1):
+        reset_timer()
+
         with get_timer("collect_rollout") as rollout_timer:
             buffer = collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer)
         
@@ -521,6 +517,8 @@ def train(cfg: DictConfig):
         writer.add_scalar('Time/Rollout', total_rollout_time, rollout_idx)
         print(f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s.")
         print(f"[INFO] Rollout {rollout_idx}: TotalTime: {total_rollout_time:.3f} s\n")
+        if cfg.enable_timer:
+            print_timing_report(title=f"Timing Report after Rollout {rollout_idx}", show_exclusive=True)
         if rollout_idx % cfg.train.save_every == 0:
             torch.save(actor.state_dict(),
                        os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))

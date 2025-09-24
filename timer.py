@@ -208,11 +208,9 @@ class HierarchicalTimerManager:
         
         # Thread-local storage for tracking the current execution stack
         self._local = threading.local()
+        self._local.timer_stack = []
         
     def _get_current_stack(self) -> List[TimerNode]:
-        """Get the current timer execution stack for this thread."""
-        if not hasattr(self._local, 'timer_stack'):
-            self._local.timer_stack = []
         return self._local.timer_stack
     
     def get_timer(self, name: str):
@@ -312,19 +310,21 @@ class HierarchicalTimerManager:
         count = node.count
         
         if show_exclusive:
-            print(f"{display_name:<50} {avg_inc_ms:<12.3f} {avg_exc_ms:<12.3f} {total_inc_ms:<14.3f} {total_exc_ms:<14.3f} {count:<8}")
+            print(f"{display_name:<50} {avg_inc_ms:>12.3f} {avg_exc_ms:>12.3f} {total_inc_ms:>14.3f} {total_exc_ms:>14.3f} {count:>8}")
         else:
-            print(f"{display_name:<50} {avg_inc_ms:<12.3f} {total_inc_ms:<14.3f} {count:<8}")
-        
+            print(f"{display_name:<50} {avg_inc_ms:>12.3f} {total_inc_ms:>14.3f} {count:>8}")
+
         # Print children recursively
         for child in node.children.values():
             if child.count > 0:
                 self._print_tree_node(child, depth + 1, show_exclusive)
     
     def reset_all(self):
-        """Reset all timers."""
-        for root in self.root_nodes.values():
-            root.reset()
+        """Reset all timers and clear the entire tree structure."""
+        self.root_nodes.clear()
+        
+        # Clear any thread-local timer stacks to avoid stale references
+        self._local.timer_stack.clear()
     
     def set_enabled(self, enabled: bool):
         """Enable or disable all timers."""
@@ -334,7 +334,6 @@ class HierarchicalTimerManager:
         # If we're changing state, clear existing timers to avoid inconsistencies
         if old_enabled != enabled:
             self.reset_all()
-            self.root_nodes.clear()
             
         # Update existing nodes
         for root in self.root_nodes.values():
@@ -345,26 +344,6 @@ class HierarchicalTimerManager:
         node.enabled = enabled
         for child in node.children.values():
             self._set_node_enabled(child, enabled)
-    
-    def get_summary(self) -> Dict[str, Dict[str, float]]:
-        """Get a summary of all timers as a dictionary."""
-        summary = {}
-        for root in self.root_nodes.values():
-            self._add_node_to_summary(root, summary)
-        return summary
-    
-    def _add_node_to_summary(self, node: TimerNode, summary: Dict[str, Dict[str, float]]):
-        """Recursively add node and its children to summary."""
-        path = node.get_path()
-        summary[path] = {
-            'avg_inclusive_ms': node.get_average_ms(),
-            'avg_exclusive_ms': node.get_average_exclusive_ms(),
-            'total_inclusive_ms': node.get_total_ms(),
-            'total_exclusive_ms': node.get_exclusive_total_ms(),
-            'count': node.count
-        }
-        for child in node.children.values():
-            self._add_node_to_summary(child, summary)
 
 
 # Global hierarchical timer manager instance for convenience
@@ -381,8 +360,8 @@ def print_timing_report(title: str = "Hierarchical Timing Report", show_exclusiv
     global_timer_manager.print_report(title, show_exclusive)
 
 
-def reset_timing_statistics():
-    """Convenience function to reset all timing statistics."""
+def reset_timer():
+    """Convenience function to reset all timing statistics and clear the timer tree."""
     global_timer_manager.reset_all()
 
 
@@ -390,8 +369,3 @@ def set_timing_enabled(enabled: bool):
     """Convenience function to enable/disable timing."""
     global_timer_manager.set_enabled(enabled)
     print(f"[Timing] Hierarchical timing {'enabled' if enabled else 'disabled'}")
-
-
-def get_timing_summary() -> Dict[str, Dict[str, float]]:
-    """Convenience function to get timing summary from global manager."""
-    return global_timer_manager.get_summary()
