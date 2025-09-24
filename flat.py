@@ -354,53 +354,84 @@ def ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rol
     minibatch_size = cfg.train.minibatch_size
     clip_eps = cfg.train.clip_eps
 
+    # Process buffer on CPU first
     obs_buf, act_buf, logp_buf, adv_buf, ret_buf = process_buffer(buffer, gamma, lam)
 
-    obs_buf = obs_buf.to(device)
-    act_buf = act_buf.to(device)
-    logp_buf = logp_buf.to(device)
-    adv_buf = adv_buf.to(device)
-    ret_buf = ret_buf.to(device)
+    # Keep data on CPU and normalize advantages
     adv_buf = (adv_buf - adv_buf.mean()) / (adv_buf.std() + 1e-8)
-    inds = torch.randperm(adv_buf.shape[0], device=device)
+    
+    # Create indices for shuffling on CPU
+    total_samples = adv_buf.shape[0]
+    inds = torch.randperm(total_samples)
+    
+    # Determine chunk size, otherwise GPU memory may blow up
+    chunk_size = min(minibatch_size * 16, total_samples)  # Process 16 minibatches
+
     actor_losses = []
     critic_losses = []
+    
     for _ in range(ppo_epochs):
-        for start in tqdm(range(0, adv_buf.shape[0], minibatch_size), desc="PPO minibatches"):
-            mb_inds = inds[start:start + minibatch_size]
-            mb_obs = obs_buf[mb_inds]
-            mb_act = act_buf[mb_inds]
-            mb_adv = adv_buf[mb_inds]
-            mb_ret = ret_buf[mb_inds]
-            mb_logp_old = logp_buf[mb_inds]
-            with autocast(device_type='cuda', enabled=use_fp16):
-                dist = actor(mb_obs)
-                logp = dist.log_prob(mb_act)
-                ratio = (logp - mb_logp_old).exp()
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
-                loss_pi = -torch.min(surr1, surr2).mean()
-            opt_actor.zero_grad()
-            if use_fp16:
-                scaler.scale(loss_pi).backward()
-                scaler.step(opt_actor)
-                scaler.update()
-            else:
-                loss_pi.backward()
-                opt_actor.step()
-            actor_losses.append(loss_pi.item())
-            with autocast(device_type='cuda', enabled=use_fp16):
-                value = critic(mb_obs).squeeze(-1)
-                loss_v = F.mse_loss(value, mb_ret)
-            opt_critic.zero_grad()
-            if use_fp16:
-                scaler.scale(loss_v).backward()
-                scaler.step(opt_critic)
-                scaler.update()
-            else:
-                loss_v.backward()
-                opt_critic.step()
-            critic_losses.append(loss_v.item())
+        # Process data in chunks to balance memory usage and transfer efficiency
+        for chunk_start in tqdm(range(0, total_samples, chunk_size), desc="PPO chunks"):
+            chunk_end = min(chunk_start + chunk_size, total_samples)
+            chunk_inds = inds[chunk_start:chunk_end]
+            
+            # Transfer chunk to GPU once
+            chunk_obs = obs_buf[chunk_inds].to(device)
+            chunk_act = act_buf[chunk_inds].to(device)
+            chunk_adv = adv_buf[chunk_inds].to(device)
+            chunk_ret = ret_buf[chunk_inds].to(device)
+            chunk_logp_old = logp_buf[chunk_inds].to(device)
+            
+            # Process minibatches within this chunk (all data already on GPU)
+            chunk_samples = chunk_end - chunk_start
+            for mb_start in tqdm(range(0, chunk_samples, minibatch_size), desc="PPO minibatches", leave=False):
+                mb_end = min(mb_start + minibatch_size, chunk_samples)
+                
+                mb_obs = chunk_obs[mb_start:mb_end]
+                mb_act = chunk_act[mb_start:mb_end]
+                mb_adv = chunk_adv[mb_start:mb_end]
+                mb_ret = chunk_ret[mb_start:mb_end]
+                mb_logp_old = chunk_logp_old[mb_start:mb_end]
+                
+                # Actor update
+                with autocast(device_type='cuda', enabled=use_fp16):
+                    dist = actor(mb_obs)
+                    logp = dist.log_prob(mb_act)
+                    ratio = (logp - mb_logp_old).exp()
+                    surr1 = ratio * mb_adv
+                    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
+                    loss_pi = -torch.min(surr1, surr2).mean()
+                
+                opt_actor.zero_grad()
+                if use_fp16:
+                    scaler.scale(loss_pi).backward()
+                    scaler.step(opt_actor)
+                    scaler.update()
+                else:
+                    loss_pi.backward()
+                    opt_actor.step()
+                actor_losses.append(loss_pi.item())
+                
+                # Critic update
+                with autocast(device_type='cuda', enabled=use_fp16):
+                    value = critic(mb_obs).squeeze(-1)
+                    loss_v = F.mse_loss(value, mb_ret)
+                
+                opt_critic.zero_grad()
+                if use_fp16:
+                    scaler.scale(loss_v).backward()
+                    scaler.step(opt_critic)
+                    scaler.update()
+                else:
+                    loss_v.backward()
+                    opt_critic.step()
+                critic_losses.append(loss_v.item())
+            
+            # Clear GPU memory for this chunk
+            del chunk_obs, chunk_act, chunk_adv, chunk_ret, chunk_logp_old
+            torch.cuda.empty_cache()
+    
     writer.add_scalar('Loss/Actor', np.mean(actor_losses), rollout_idx)
     writer.add_scalar('Loss/Critic', np.mean(critic_losses), rollout_idx)
 
