@@ -25,8 +25,7 @@ dependencies:
     - roma
     - hydra-core
     - "imageio[ffmpeg]"
-    - scikit-image
-    - scikit-learn
+    - pygame
 
     - stable-baselines3
     - "gymnasium[other,classic-control]"

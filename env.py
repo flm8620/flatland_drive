@@ -2,7 +2,6 @@ import os
 import numpy as np
 import cv2
 import time
-from collections import deque
 import torch
 import torch.nn.functional as F
 from numba import jit, types
