@@ -55,9 +55,11 @@ train:
   num_rollouts: 2000 
   fp16: false
 
+
 # Logging
 log_dir: ${hydra:run.dir}/tb
 run_name: ${now:%Y-%m-%d_%H-%M-%S}
+enable_timer: true
 
 # Seed
 seed: 42

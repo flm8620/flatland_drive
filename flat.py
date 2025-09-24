@@ -49,6 +49,7 @@ multiprocessing.set_start_method('spawn', force=True)
 
 from env import ParallelDrivingEnv, get_human_frame
 from networks import ViTEncoder, ConvEncoder
+from timer import get_timer, set_timing_enabled, print_timing_report
 
 
 def make_encoder(cfg, view_size, num_levels):
@@ -411,6 +412,9 @@ def train(cfg: DictConfig):
     os.makedirs(run_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_dir)
 
+    if cfg.enable_timer:
+        set_timing_enabled(True)
+
     device = torch.device("cuda")
     num_levels = cfg.env.num_levels
     actor = Actor(cfg, cfg.env.view_size, num_levels=num_levels).to(device)
@@ -466,24 +470,26 @@ def train(cfg: DictConfig):
 
     num_rollouts = cfg.train.num_rollouts
     for rollout_idx in range(start_rollout_idx, num_rollouts + 1):
-        rollout_start_time = time.time()
-        # --- Collect rollout (now includes env creation, logging, and video saving) ---
-        buffer = collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer)
-        update_start_time = time.time()
-        print(f"[INFO] Rollout {rollout_idx}: Record took {update_start_time - rollout_start_time:.3f} s.")
+        with get_timer("collect_rollout") as rollout_timer:
+            buffer = collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer)
+        
+        # Get the rollout collection time from the timer instance
+        rollout_collection_time = rollout_timer.elapsed()
+        print(f"[INFO] Rollout {rollout_idx}: Record took {rollout_collection_time:.3f} s.")
 
-        writer.add_scalar('Time/Record', update_start_time - rollout_start_time, rollout_idx)
-        # --- PPO update ---
-        ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rollout_idx, opt_actor, opt_critic)
-        update_time = time.time() - update_start_time
-        rollout_time = time.time() - rollout_start_time
+        writer.add_scalar('Time/Record', rollout_collection_time, rollout_idx)
+        
+        with get_timer("ppo_update") as update_timer:
+            ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rollout_idx, opt_actor, opt_critic)
+        
+        # Get the update time from the timer instance
+        update_time = update_timer.elapsed()
+        total_rollout_time = rollout_collection_time + update_time
+        
         writer.add_scalar('Time/Update', update_time, rollout_idx)
-        writer.add_scalar('Time/Rollout', rollout_time, rollout_idx)
-        print(
-            f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s."
-        )
-        print(
-            f"[INFO] Rollout {rollout_idx}: TotalTime: {rollout_time:.3f} s\n")
+        writer.add_scalar('Time/Rollout', total_rollout_time, rollout_idx)
+        print(f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s.")
+        print(f"[INFO] Rollout {rollout_idx}: TotalTime: {total_rollout_time:.3f} s\n")
         if rollout_idx % cfg.train.save_every == 0:
             torch.save(actor.state_dict(),
                        os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))
