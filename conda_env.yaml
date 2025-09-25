@@ -13,6 +13,7 @@ dependencies:
     - torch==2.6.0+cu124
     - torchvision==0.21.0+cu124
     - torchaudio==2.6.0+cu124
+    - tensordict
 
     - numpy>=2.0
     - tqdm

@@ -42,6 +42,7 @@ from hydra.utils import to_absolute_path
 from torch.utils.tensorboard import SummaryWriter
 import imageio.v2 as imageio
 from torch.amp import autocast, GradScaler
+from tensordict import TensorDict
 
 # Set multiprocessing start method to 'spawn' for CUDA compatibility
 multiprocessing.set_start_method('spawn', force=True)
@@ -56,11 +57,15 @@ def make_encoder(cfg, view_size, num_levels):
     if cfg.model.type == 'vit':
         return ViTEncoder(view_size,
                           num_levels=num_levels,
-                          embed_dim=cfg.model.vit_embed_dim)
+                          embed_dim=cfg.model.vit_embed_dim,
+                          in_chans=2,
+                          state_dim=2)
     elif cfg.model.type == 'conv':
         return ConvEncoder(view_size,
                            num_levels=num_levels,
-                           out_dim=cfg.model.conv_out_dim)
+                           out_dim=cfg.model.conv_out_dim,
+                           in_chans=2,
+                           state_dim=2)
     else:
         raise ValueError(f"Unknown model type: {cfg.model.type}")
 
@@ -108,12 +113,18 @@ class Critic(nn.Module):
 ##########################
 class RolloutBuffer:
 
-    def __init__(self, n_steps, n_envs, obs_shape):
+    def __init__(self, n_steps, n_envs, image_shape, state_shape):
         self.n_steps = n_steps
         self.n_envs = n_envs
         self.ptr = 0
         self.full = False
-        self.obs = torch.zeros((n_steps, n_envs, *obs_shape), dtype=torch.float32, device='cpu')
+        
+        # TensorDict storage for observations
+        self.obs = TensorDict({
+            'image': torch.zeros((n_steps, n_envs, *image_shape), dtype=torch.uint8, device='cpu'),
+            'state': torch.zeros((n_steps, n_envs, *state_shape), dtype=torch.float32, device='cpu')
+        }, batch_size=[n_steps, n_envs])
+        
         self.actions = torch.zeros((n_steps, n_envs), dtype=torch.long, device='cpu')
         self.rewards = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
         self.is_terminated = torch.zeros((n_steps, n_envs), dtype=torch.float32, device='cpu')
@@ -124,8 +135,8 @@ class RolloutBuffer:
         self.final_is_terminated = None
         self.final_is_truncated = None
 
-    def add(self, obs, action, reward, is_terminated, is_truncated, logprob, value):
-        self.obs[self.ptr].copy_(obs.cpu())
+    def add(self, obs_dict, action, reward, is_terminated, is_truncated, logprob, value):
+        self.obs[self.ptr] = obs_dict.cpu()
         self.actions[self.ptr].copy_(action.cpu())
         self.rewards[self.ptr].copy_(reward.cpu())
         self.is_terminated[self.ptr].copy_(is_terminated.cpu())
@@ -187,7 +198,10 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     num_envs = cfg.env.num_envs
     num_levels = cfg.env.num_levels
     rollout_steps = cfg.train.rollout_steps
-    obs_shape = (num_levels, 4, cfg.env.view_size, cfg.env.view_size)
+    
+    # Define observation shapes for dict format
+    image_shape = (num_levels, 2, cfg.env.view_size, cfg.env.view_size)  # uint8 images
+    state_shape = (2,)  # float32 velocity
     
     if curriculum:
         for stage in curriculum:
@@ -223,15 +237,16 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     )
     
     print(f"[INFO] Rollout {rollout_idx}: Start recording transitions... (min/max dist: {min_start_goal_dist}-{max_start_goal_dist}, hitwall: {hitwall_cost})")
-    buffer = RolloutBuffer(rollout_steps, num_envs, obs_shape)
+    buffer = RolloutBuffer(rollout_steps, num_envs, image_shape, state_shape)
     gamma = cfg.train.gamma
     render_this_rollout = (cfg.env.render_every > 0 and rollout_idx % cfg.env.render_every == 0 or rollout_idx == 1)
     video_frames = None
     if render_this_rollout:
         video_frames = [[] for _ in range(cfg.env.num_envs)]
     
-    next_obs, _ = env.reset()
-    next_obs = next_obs.to(device)  # Already on GPU from parallel env
+    next_obs_dict, _ = env.reset()
+    # Move observation dict to device using TensorDict
+    next_obs_dict = next_obs_dict.to(device)
     is_next_terminated = torch.zeros(num_envs, dtype=torch.bool)
     is_next_truncated = torch.zeros(num_envs, dtype=torch.bool)
     episode_rewards = []
@@ -241,25 +256,26 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     failure_count = 0
     
     for step in tqdm(range(rollout_steps), desc=f"Rollout {rollout_idx} steps", smoothing=0.01):
-        cur_obs = next_obs
+        cur_obs_dict = next_obs_dict
         is_current_terminated = is_next_terminated.clone()
         is_current_truncated = is_next_truncated.clone()
 
         with get_timer("inference"):
             with torch.no_grad():
-                dist = actor(cur_obs)
+                dist = actor(cur_obs_dict)
                 action = dist.sample()
                 logprob = dist.log_prob(action)
-                value = critic(cur_obs).squeeze(-1)
+                value = critic(cur_obs_dict).squeeze(-1)
 
         with get_timer("step"):
-            next_obs, reward, terminated, truncated, infos = env.step(action)
+            next_obs_dict, reward, terminated, truncated, infos = env.step(action)
+            next_obs_dict = next_obs_dict.to(device)
         
         if render_this_rollout:
             with get_timer("render"):
                 for env_id in cfg.env.render_env_ids:
-                    # Convert tensors to numpy for rendering
-                    obs_np = cur_obs[env_id].cpu().numpy()
+                    # Extract single environment observation using TensorDict indexing
+                    env_obs_dict = cur_obs_dict[env_id]
                     vel_np = infos['vel'][env_id].cpu().numpy()
                     action_item = action[env_id]
                     
@@ -270,7 +286,7 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
                         'hitwall': infos['hitwall'][env_id].item(),
                     }
                     
-                    frame = get_human_frame(obs=obs_np,
+                    frame = get_human_frame(obs_dict=env_obs_dict,
                                             vel=vel_np,
                                             v_max=cfg.env.v_max,
                                             action=action_item,
@@ -279,7 +295,7 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     video_frames[env_id].append(frame_rgb)
         
-        buffer.add(cur_obs, action, reward,
+        buffer.add(cur_obs_dict, action, reward,
                    is_current_terminated,
                    is_current_truncated,
                    logprob, value)
@@ -306,7 +322,7 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
                         failure_count += 1
     
     with torch.no_grad():
-        next_value = critic(next_obs).squeeze(-1)
+        next_value = critic(next_obs_dict).squeeze(-1)
     buffer.add_final_step_info(next_value, is_next_terminated, is_next_truncated)
 
     if episode_rewards:
@@ -324,17 +340,14 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     return buffer
 
 def process_buffer(buffer, gamma, lam):
-    obs_raw = buffer.obs
-    act_raw = buffer.actions
-    logp_raw = buffer.logprobs
-
     adv_buf, ret_buf, is_valid_buf = compute_gae(buffer, gamma, lam)
 
     is_valid_buf = is_valid_buf.reshape(-1)
 
-    obs_buf = obs_raw.reshape(-1, *obs_raw.shape[2:])[is_valid_buf]
-    act_buf = act_raw.reshape(-1)[is_valid_buf]
-    logp_buf = logp_raw.reshape(-1)[is_valid_buf]
+    # Use TensorDict reshape and indexing for cleaner code
+    obs_buf = buffer.obs.reshape(-1)[is_valid_buf]  # TensorDict with flattened batch dimension
+    act_buf = buffer.actions.reshape(-1)[is_valid_buf]
+    logp_buf = buffer.logprobs.reshape(-1)[is_valid_buf]
     adv_buf = adv_buf.reshape(-1)[is_valid_buf]
     ret_buf = ret_buf.reshape(-1)[is_valid_buf]
 
@@ -370,7 +383,7 @@ def ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rol
             chunk_end = min(chunk_start + chunk_size, total_samples)
             chunk_inds = inds[chunk_start:chunk_end]
             
-            # Transfer chunk to GPU once
+            # Transfer chunk to GPU once - TensorDict handles device transfer automatically
             chunk_obs = obs_buf[chunk_inds].to(device)
             chunk_act = act_buf[chunk_inds].to(device)
             chunk_adv = adv_buf[chunk_inds].to(device)
@@ -382,7 +395,12 @@ def ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rol
             for mb_start in tqdm(range(0, chunk_samples, minibatch_size), desc="PPO minibatches", leave=False):
                 mb_end = min(mb_start + minibatch_size, chunk_samples)
                 
-                mb_obs = chunk_obs[mb_start:mb_end]
+                # Extract minibatch using TensorDict indexing
+                mb_obs_dict = chunk_obs[mb_start:mb_end]
+                mb_act = chunk_act[mb_start:mb_end]
+                mb_adv = chunk_adv[mb_start:mb_end]
+                mb_ret = chunk_ret[mb_start:mb_end]
+                mb_logp_old = chunk_logp_old[mb_start:mb_end]
                 mb_act = chunk_act[mb_start:mb_end]
                 mb_adv = chunk_adv[mb_start:mb_end]
                 mb_ret = chunk_ret[mb_start:mb_end]
@@ -390,7 +408,7 @@ def ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rol
                 
                 # Actor update
                 with autocast(device_type='cuda', enabled=use_fp16):
-                    dist = actor(mb_obs)
+                    dist = actor(mb_obs_dict)
                     logp = dist.log_prob(mb_act)
                     ratio = (logp - mb_logp_old).exp()
                     surr1 = ratio * mb_adv
@@ -409,7 +427,7 @@ def ppo_update(buffer, critic, actor, cfg, device, scaler, use_fp16, writer, rol
                 
                 # Critic update
                 with autocast(device_type='cuda', enabled=use_fp16):
-                    value = critic(mb_obs).squeeze(-1)
+                    value = critic(mb_obs_dict).squeeze(-1)
                     loss_v = F.mse_loss(value, mb_ret)
                 
                 opt_critic.zero_grad()

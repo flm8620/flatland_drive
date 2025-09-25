@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from numba import jit, types
 from numba.typed import List
 from timer import get_timer
+from tensordict import TensorDict
 
 
 @jit(nopython=True, cache=True)
@@ -475,7 +476,7 @@ class ParallelDrivingEnv:
         return crops.contiguous()
 
     def _get_obs(self):
-        """Generate observations for all environments in parallel using efficient batched cropping"""
+        """Generate observations as dict with separate image and state components"""
         levels = []
         
         # Get agent positions as floats for all environments
@@ -500,21 +501,16 @@ class ParallelDrivingEnv:
                 self.view_size
             )
             
-            # Set drivable areas to -1
-            cost_crops = torch.where(cost_crops == 0.0, -1.0, cost_crops)
+            # Convert binary cost maps to uint8: 0 (drivable) -> 0, 1 (wall) -> 255
+            cost_crops_uint8 = (cost_crops * 255).to(torch.uint8)
             
-            # Create velocity channels
-            vel_x = self.vel[:, 0:1] / self.v_max  # (num_envs, 1)
-            vel_y = self.vel[:, 1:2] / self.v_max  # (num_envs, 1)
-            vel_x_maps = vel_x.unsqueeze(-1).expand(-1, self.view_size, self.view_size)
-            vel_y_maps = vel_y.unsqueeze(-1).expand(-1, self.view_size, self.view_size)
+            # Create target channels (uint8)
+            target_maps = torch.zeros((self.num_envs, self.view_size, self.view_size), 
+                                    device=self.device, dtype=torch.uint8)
             
-            # Create target channels
-            target_maps = torch.zeros((self.num_envs, self.view_size, self.view_size), device=self.device)
-            
-            # Mark agent centers for all environments at once
+            # Mark agent centers for all environments at once (value 128)
             center = self.view_size // 2
-            target_maps[:, center-2:center+2, center-2:center+2] = 0.5
+            target_maps[:, center-2:center+2, center-2:center+2] = 128
             
             # Target position relative to top-left corner of the crop
             target_in_crop = scaled_target_pos.long() - tl_corners  # (num_envs, 2)
@@ -527,7 +523,7 @@ class ParallelDrivingEnv:
             valid_mask = (tx_crop >= 1) & (tx_crop < self.view_size - 2) & \
                         (ty_crop >= 1) & (ty_crop < self.view_size - 2)
             
-            # Use advanced indexing to mark all targets at once
+            # Use advanced indexing to mark all targets at once (value 255)
             if valid_mask.any():
                 valid_envs = torch.where(valid_mask)[0]
                 valid_tx = tx_crop[valid_mask]
@@ -546,29 +542,39 @@ class ParallelDrivingEnv:
                 x_indices = (valid_tx.unsqueeze(1) + dx_flat.unsqueeze(0)).flatten()  # (num_valid * 16,)
                 
                 # Set target values using advanced indexing
-                target_maps[env_indices, y_indices, x_indices] = 1.0
+                target_maps[env_indices, y_indices, x_indices] = 255
             
-            # Stack channels: cost, vel_x, vel_y, target
-            level_obs = torch.stack([cost_crops, vel_x_maps, vel_y_maps, target_maps], dim=1)  # (num_envs, 4, view_size, view_size)
+            # Stack image channels: cost, target (uint8, 2 channels)
+            level_obs = torch.stack([cost_crops_uint8, target_maps], dim=1)  # (num_envs, 2, view_size, view_size)
             levels.append(level_obs)
         
-        # Stack pyramid: shape (num_envs, num_levels, 4, view_size, view_size)
-        obs = torch.stack(levels, dim=1)
-        return obs
+        # Stack pyramid for images: shape (num_envs, num_levels, 2, view_size, view_size)
+        image_obs = torch.stack(levels, dim=1)
+        
+        # State observation: normalized velocity (float32)
+        state_obs = self.vel / self.v_max  # (num_envs, 2)
+        
+        return TensorDict({
+            'image': image_obs,  # uint8 tensor
+            'state': state_obs   # float32 tensor
+        }, batch_size=[self.num_envs])
 
 
-def get_human_frame(obs, vel, v_max, action=None, info=None, a_max=None):
+def get_human_frame(obs_dict, vel, v_max, action=None, info=None, a_max=None):
     """
     Generate a high-res visualization for human viewing.
-    Modified to work with the new observation format.
+    Modified to work with the new dict observation format.
     """
-    # obs is now (num_levels, 4, view_size, view_size) for a single environment
+    # obs_dict is now {'image': (num_levels, 2, view_size, view_size), 'state': (2,)} for a single environment
+    image_obs = obs_dict['image']  # (num_levels, 2, view_size, view_size)
+    state_obs = obs_dict['state']  # (2,) - normalized velocity
+    
     vis_levels = []
     canvas_size = 256
-    num_levels = obs.shape[0]
+    num_levels = image_obs.shape[0]
     
     for i in range(num_levels):
-        img = obs_level_to_image(obs[i], canvas_size=canvas_size)
+        img = obs_level_to_image(image_obs[i], canvas_size=canvas_size)
         # Draw agent (center)
         cx, cy = canvas_size // 2, canvas_size // 2
         cv2.circle(img, (cx, cy), 3, (0, 255, 0), 2)
@@ -621,25 +627,28 @@ def get_human_frame(obs, vel, v_max, action=None, info=None, a_max=None):
 
 def obs_level_to_image(obs_level, canvas_size):
     """
-    Convert a single observation level (4, H, W) to a visualization image.
+    Convert a single observation level (2, H, W) uint8 to a visualization image.
+    New format: channel 0 = cost map, channel 1 = target map
     """
-    # Convert to numpy if it's a tensor
-    if hasattr(obs_level, 'cpu'):
-        obs_level = obs_level.cpu().numpy()
+    obs_level = obs_level.cpu().numpy()
     
-    cost = obs_level[0]
-    target_map = obs_level[3]
-    # Normalize cost: -1 (drivable) -> 0 (black), 1 (non-drivable) -> 255 (white)
-    cost_norm = (cost + 1) / 2  # -1..1 -> 0..1
+    cost = obs_level[0].astype(np.float32)  # (H, W) uint8 -> float32
+    target_map = obs_level[1].astype(np.float32)  # (H, W) uint8 -> float32
+    
+    # Normalize cost: 0 (drivable) -> 0 (black), 255 (wall) -> 1.0 (white)
+    cost_norm = cost / 255.0  # 0..255 -> 0..1
     img = np.stack([cost_norm, cost_norm, cost_norm], axis=-1)  # (H, W, 3)
     img = (img * 255).astype(np.uint8)
+    
     # Overlay target as magenta heatmap
+    # target_map: 0 (no target), 128 (agent), 255 (goal)
     magenta = np.zeros_like(img)
     magenta[..., 0] = 255  # Red
     magenta[..., 2] = 255  # Blue
-    alpha = np.clip(target_map, 0, 1)[..., None]  # (H, W, 1)
+    alpha = np.clip(target_map / 255.0, 0, 1)[..., None]  # (H, W, 1)
     img = img * (1 - alpha) + magenta * alpha
     img = img.astype(np.uint8)
+    
     # Upscale
     img = cv2.resize(img, (canvas_size, canvas_size), interpolation=cv2.INTER_NEAREST)
     return img
