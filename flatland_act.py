@@ -5,18 +5,10 @@ Adapted for the maze navigation task with multi-scale observations
 """
 
 import os
-import sys
-import time
-import json
-import copy
-import math
 import h5py
 import logging
 import numpy as np
-from collections import OrderedDict
-from typing import Optional, List, Tuple, Dict
 from tqdm import tqdm
-from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -27,6 +19,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+
+# Import timer utilities
+from timer import get_timer, set_timing_enabled, reset_timer, print_timing_report
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -49,35 +44,36 @@ class FlatlandDataset(Dataset):
         self.chunk_size = chunk_size
         self.mode = mode
         
-        # Load data
-        with h5py.File(h5_file_path, 'r') as f:
-            # Get metadata
-            total_episodes = f.attrs['total_episodes']
-            self.view_size = f.attrs['view_size']
-            self.num_levels = f.attrs['num_levels']
-            
-            # Load episode metadata
-            episodes = f['episodes'][:total_episodes]
-            
-            # Split episodes
-            split_idx = int(total_episodes * train_split)
-            if mode == 'train':
-                self.episodes = episodes[:split_idx]
-            else:  # val
-                self.episodes = episodes[split_idx:]
-            
-            print(f"{mode.capitalize()} split: {len(self.episodes)} episodes")
-            
-            # Build list of valid starting positions for chunks
-            self.valid_starts = []
-            for ep in self.episodes:
-                start_idx = ep['start_idx']
-                length = ep['length']
-                # Can start a chunk at any position where we have enough future actions
-                for i in range(length - chunk_size + 1):
-                    self.valid_starts.append((start_idx + i, ep['success']))
-            
-            print(f"Total valid chunk starts: {len(self.valid_starts)}")
+        # Open HDF5 file and keep it open for the dataset lifetime
+        self.h5_file = h5py.File(h5_file_path, 'r')
+        
+        # Get metadata
+        total_episodes = self.h5_file.attrs['total_episodes']
+        self.view_size = self.h5_file.attrs['view_size']
+        self.num_levels = self.h5_file.attrs['num_levels']
+        
+        # Load episode metadata
+        episodes = self.h5_file['episodes'][:total_episodes]
+        
+        # Split episodes
+        split_idx = int(total_episodes * train_split)
+        if mode == 'train':
+            self.episodes = episodes[:split_idx]
+        else:  # val
+            self.episodes = episodes[split_idx:]
+        
+        print(f"{mode.capitalize()} split: {len(self.episodes)} episodes")
+        
+        # Build list of valid starting positions for chunks
+        self.valid_starts = []
+        for ep in self.episodes:
+            start_idx = ep['start_idx']
+            length = ep['length']
+            # Can start a chunk at any position where we have enough future actions
+            for i in range(length - chunk_size + 1):
+                self.valid_starts.append(start_idx + i)
+        
+        print(f"Total valid chunk starts: {len(self.valid_starts)}")
     
     def __len__(self):
         return len(self.valid_starts)
@@ -85,32 +81,48 @@ class FlatlandDataset(Dataset):
     def __getitem__(self, idx):
         """
         Returns:
-            observation: (num_levels, 4, view_size, view_size)
+            observation: TensorDict with 'image' and 'state' keys
             actions: (chunk_size,) - future actions to predict
             mask: (chunk_size,) - padding mask (all True for now)
         """
-        start_idx, is_success = self.valid_starts[idx]
-        
-        with h5py.File(self.h5_file_path, 'r') as f:
-            # Load observation at start position
-            obs = f['observations'][start_idx]  # (num_levels, 4, view_size, view_size)
+        with get_timer("dataset_getitem"):
+            start_idx = self.valid_starts[idx]
             
-            # Load next chunk_size actions
-            actions = f['actions'][start_idx:start_idx + self.chunk_size]
-        
-        # Convert to tensors
-        obs_tensor = torch.from_numpy(obs).float()
-        actions_tensor = torch.from_numpy(actions).long()
-        
-        # Create mask (no padding for now)
-        mask = torch.ones(self.chunk_size, dtype=torch.bool)
-        
-        return {
-            'observations': obs_tensor,
-            'actions': actions_tensor,
-            'mask': mask,
-            'is_success': torch.tensor(is_success, dtype=torch.bool)
-        }
+            with get_timer("h5_file_read"):
+                # Load observations at start position - NEW FORMAT
+                # Images: (num_levels, 2, view_size, view_size) uint8
+                obs_images = self.h5_file['obs_images'][start_idx]  
+                # State: (2,) float32 - velocity information
+                obs_states = self.h5_file['obs_states'][start_idx]
+                
+                # Load next chunk_size actions
+                actions = self.h5_file['actions'][start_idx:start_idx + self.chunk_size]
+            
+            with get_timer("tensor_conversion"):
+                # Convert to tensors
+                obs_images_tensor = torch.from_numpy(obs_images).float() / 255.0  # Convert uint8 to float [0,1]
+                obs_states_tensor = torch.from_numpy(obs_states).float()
+                actions_tensor = torch.from_numpy(actions).long()
+                
+                # Create observation dictionary (plain dict, no batch dimension for single sample)
+                obs_dict = {
+                    'image': obs_images_tensor,  # (num_levels, 2, view_size, view_size)
+                    'state': obs_states_tensor   # (2,) velocity
+                }
+                
+                # Create mask (no padding for now)
+                mask = torch.ones(self.chunk_size, dtype=torch.bool)
+            
+            return {
+                'observations': obs_dict,
+                'actions': actions_tensor,
+                'mask': mask,
+            }
+    
+    def __del__(self):
+        """Close HDF5 file when dataset is destroyed."""
+        if hasattr(self, 'h5_file'):
+            self.h5_file.close()
 
 
 def get_sinusoid_encoding_table(n_position, d_hid):
@@ -136,11 +148,12 @@ class MultiScaleObsEncoder(nn.Module):
         self.feature_dim = feature_dim
         
         # Individual encoders for each scale level
+        # Note: New format has 2 channels instead of 4 (cost + target maps)
         self.level_encoders = nn.ModuleList()
         for level in range(num_levels):
             encoder = nn.Sequential(
-                # Input: (4, view_size, view_size)
-                nn.Conv2d(4, 32, kernel_size=8, stride=4, padding=2),
+                # Input: (2, view_size, view_size) - cost map + target map
+                nn.Conv2d(2, 32, kernel_size=8, stride=4, padding=2),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), 
                 nn.ReLU(inplace=True),
@@ -153,35 +166,54 @@ class MultiScaleObsEncoder(nn.Module):
             )
             self.level_encoders.append(encoder)
         
-        # Fusion network to combine multi-scale features
+        # State encoder for velocity information
+        self.state_encoder = nn.Sequential(
+            nn.Linear(2, 64),  # Input: (2,) velocity
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 128),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Fusion network to combine multi-scale features + state
+        fusion_input_dim = num_levels * feature_dim + 128  # Image features + state features
         self.fusion = nn.Sequential(
-            nn.Linear(num_levels * feature_dim, hidden_dim),
+            nn.Linear(fusion_input_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True)
         )
         
-    def forward(self, x):
+    def forward(self, obs_dict):
         """
         Args:
-            x: (batch_size, num_levels, 4, view_size, view_size)
+            obs_dict: Dictionary with keys:
+                - 'image': (batch_size, num_levels, 2, view_size, view_size)
+                - 'state': (batch_size, 2) - velocity information
         Returns:
             features: (batch_size, hidden_dim)
         """
-        batch_size = x.size(0)
-        
-        # Encode each level separately
-        level_features = []
-        for level in range(self.num_levels):
-            level_input = x[:, level]  # (batch_size, 4, view_size, view_size)
-            level_feat = self.level_encoders[level](level_input)  # (batch_size, feature_dim)
-            level_features.append(level_feat)
-        
-        # Concatenate and fuse
-        combined = torch.cat(level_features, dim=1)  # (batch_size, num_levels * feature_dim)
-        output = self.fusion(combined)  # (batch_size, hidden_dim)
-        
-        return output
+        with get_timer("obs_encoder_forward"):
+            images = obs_dict['image']
+            states = obs_dict['state']
+            batch_size = images.size(0)
+            
+            # Encode each level separately
+            level_features = []
+            with get_timer("level_encoding"):
+                for level in range(self.num_levels):
+                    level_input = images[:, level]  # (batch_size, 2, view_size, view_size)
+                    level_feat = self.level_encoders[level](level_input)  # (batch_size, feature_dim)
+                    level_features.append(level_feat)
+            
+            # Encode state information
+            state_features = self.state_encoder(states)  # (batch_size, 128)
+            
+            # Concatenate and fuse
+            with get_timer("feature_fusion"):
+                combined = torch.cat(level_features + [state_features], dim=1)  # (batch_size, fusion_input_dim)
+                output = self.fusion(combined)  # (batch_size, hidden_dim)
+            
+            return output
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -294,17 +326,19 @@ class FlatlandACT(nn.Module):
             hidden_dim=hidden_dim
         )
         
-        # Transformer encoder (for observations)
-        encoder_layer = TransformerEncoderLayer(
-            hidden_dim, nhead, dim_feedforward, dropout
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_encoder_layers)
+        # Transformer encoder (for observations) - manual implementation to avoid built-in bugs
+        self.encoder_layers = nn.ModuleList([
+            TransformerEncoderLayer(hidden_dim, nhead, dim_feedforward, dropout)
+            for _ in range(num_encoder_layers)
+        ])
+        self.num_encoder_layers = num_encoder_layers
         
-        # Transformer decoder (for action sequence generation)
-        decoder_layer = TransformerDecoderLayer(
-            hidden_dim, nhead, dim_feedforward, dropout
-        )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_decoder_layers)
+        # Transformer decoder (for action sequence generation) - manual implementation
+        self.decoder_layers = nn.ModuleList([
+            TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout)
+            for _ in range(num_decoder_layers)
+        ])
+        self.num_decoder_layers = num_decoder_layers
         
         # Action queries (learnable embeddings for each position in action sequence)
         self.action_queries = nn.Parameter(torch.randn(chunk_size, hidden_dim))
@@ -332,7 +366,7 @@ class FlatlandACT(nn.Module):
     def forward(self, observations, actions=None, mask=None):
         """
         Args:
-            observations: (batch_size, num_levels, 4, view_size, view_size)
+            observations: Dictionary with 'image' and 'state' keys
             actions: (batch_size, chunk_size) - ground truth actions for training
             mask: (batch_size, chunk_size) - padding mask
             
@@ -342,43 +376,53 @@ class FlatlandACT(nn.Module):
         For training, actions should be provided.
         For inference, actions should be None.
         """
-        batch_size = observations.size(0)
-        device = observations.device
-        
-        # Encode observations
-        obs_features = self.obs_encoder(observations)  # (batch_size, hidden_dim)
-        
-        # Add batch dimension and transpose for transformer: (1, batch_size, hidden_dim)
-        memory = obs_features.unsqueeze(0)
-        
-        # Pass through encoder (this step could be skipped for single observation)
-        memory = self.transformer_encoder(memory)  # (1, batch_size, hidden_dim)
-        
-        # Prepare action queries
-        # action_queries: (chunk_size, hidden_dim) -> (chunk_size, batch_size, hidden_dim)
-        tgt = self.action_queries.unsqueeze(1).repeat(1, batch_size, 1)
-        
-        # Add positional encoding to queries
-        query_pos = self.pos_encoding[0, :self.chunk_size].unsqueeze(1).repeat(1, batch_size, 1)
-        
-        # Generate causal mask for decoder (autoregressive generation)
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.chunk_size).to(device)
-        
-        # Pass through decoder
-        output = self.transformer_decoder(
-            tgt=tgt,
-            memory=memory,
-            tgt_mask=tgt_mask,
-            query_pos=query_pos
-        )  # (chunk_size, batch_size, hidden_dim)
-        
-        # Transpose back: (batch_size, chunk_size, hidden_dim)
-        output = output.transpose(0, 1)
-        
-        # Generate action logits
-        logits = self.action_head(output)  # (batch_size, chunk_size, action_dim)
-        
-        return logits
+        with get_timer("act_forward"):
+            # Get batch size from the observations dictionary
+            batch_size = observations['image'].size(0)
+            device = observations['image'].device
+            
+            # Encode observations
+            with get_timer("observation_encoding"):
+                obs_features = self.obs_encoder(observations)  # (batch_size, hidden_dim)
+            
+            # Add batch dimension and transpose for transformer: (1, batch_size, hidden_dim)
+            with get_timer("memory_preparation"):
+                memory = obs_features.unsqueeze(0)
+                
+                # Pass through encoder layers manually
+                for encoder_layer in self.encoder_layers:
+                    memory = encoder_layer(memory)  # (1, batch_size, hidden_dim)
+            
+            # Prepare action queries
+            with get_timer("query_preparation"):
+                # action_queries: (chunk_size, hidden_dim) -> (chunk_size, batch_size, hidden_dim)
+                tgt = self.action_queries.unsqueeze(1).repeat(1, batch_size, 1)
+                
+                # Add positional encoding to queries
+                query_pos = self.pos_encoding[0, :self.chunk_size].unsqueeze(1).repeat(1, batch_size, 1)
+                
+                # Generate causal mask for decoder (autoregressive generation)
+                tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.chunk_size).to(device)
+            
+            # Pass through decoder layers manually
+            with get_timer("decoder_forward"):
+                output = tgt
+                for decoder_layer in self.decoder_layers:
+                    output = decoder_layer(
+                        tgt=output,
+                        memory=memory,
+                        tgt_mask=tgt_mask,
+                        query_pos=query_pos
+                    )  # (chunk_size, batch_size, hidden_dim)
+            
+            # Transpose back: (batch_size, chunk_size, hidden_dim)
+            with get_timer("output_projection"):
+                output = output.transpose(0, 1)
+                
+                # Generate action logits
+                logits = self.action_head(output)  # (batch_size, chunk_size, action_dim)
+            
+            return logits
     
     def generate(self, observations):
         """Generate actions for inference (non-autoregressive for now)"""
@@ -393,54 +437,73 @@ class ACTTrainer:
     """Trainer for the Flatland ACT model"""
     
     def __init__(self, cfg: DictConfig):
+        reset_timer()
         self.cfg = cfg
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Create datasets
-        self.train_dataset = FlatlandDataset(
-            h5_file_path=cfg.data.h5_file_path,
-            chunk_size=cfg.model.chunk_size,
-            train_split=cfg.data.train_split,
-            mode='train'
-        )
+        # Enable timing if requested
+        if hasattr(cfg, 'enable_timer') and cfg.enable_timer:
+            set_timing_enabled(True)
         
-        self.val_dataset = FlatlandDataset(
-            h5_file_path=cfg.data.h5_file_path,
-            chunk_size=cfg.model.chunk_size,
-            train_split=cfg.data.train_split,
-            mode='val'
-        )
+        # Create datasets
+        with get_timer("dataset_creation"):
+            self.train_dataset = FlatlandDataset(
+                h5_file_path=cfg.data.h5_file_path,
+                chunk_size=cfg.model.chunk_size,
+                train_split=cfg.data.train_split,
+                mode='train'
+            )
+            
+            self.val_dataset = FlatlandDataset(
+                h5_file_path=cfg.data.h5_file_path,
+                chunk_size=cfg.model.chunk_size,
+                train_split=cfg.data.train_split,
+                mode='val'
+            )
         
         # Create data loaders
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=cfg.training.batch_size,
-            shuffle=True,
-            num_workers=cfg.training.num_workers,
-            pin_memory=True
-        )
-        
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=cfg.training.batch_size,
-            shuffle=False,
-            num_workers=cfg.training.num_workers,
-            pin_memory=True
-        )
+        with get_timer("dataloader_creation"):
+            # Configure timing for multiprocessing
+            if cfg.training.num_workers > 0:
+                # With multiprocessing, we need to configure timers for worker processes
+                # The main process keeps timers enabled, workers will disable them
+                worker_init_fn = self._worker_init_fn
+            else:
+                # Single-threaded: keep all timers enabled
+                worker_init_fn = None
+            
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=cfg.training.batch_size,
+                shuffle=True,
+                num_workers=cfg.training.num_workers,
+                pin_memory=True,
+                worker_init_fn=worker_init_fn
+            )
+            
+            self.val_loader = DataLoader(
+                self.val_dataset,
+                batch_size=cfg.training.batch_size,
+                shuffle=False,
+                num_workers=cfg.training.num_workers,
+                pin_memory=True,
+                worker_init_fn=worker_init_fn
+            )
         
         # Create model
-        self.model = FlatlandACT(
-            num_levels=self.train_dataset.num_levels,
-            view_size=self.train_dataset.view_size,
-            action_dim=cfg.model.action_dim,
-            chunk_size=cfg.model.chunk_size,
-            hidden_dim=cfg.model.hidden_dim,
-            nhead=cfg.model.nhead,
-            num_encoder_layers=cfg.model.num_encoder_layers,
-            num_decoder_layers=cfg.model.num_decoder_layers,
-            dim_feedforward=cfg.model.dim_feedforward,
-            dropout=cfg.model.dropout
-        ).to(self.device)
+        with get_timer("model_creation"):
+            self.model = FlatlandACT(
+                num_levels=self.train_dataset.num_levels,
+                view_size=self.train_dataset.view_size,
+                action_dim=cfg.model.action_dim,
+                chunk_size=cfg.model.chunk_size,
+                hidden_dim=cfg.model.hidden_dim,
+                nhead=cfg.model.nhead,
+                num_encoder_layers=cfg.model.num_encoder_layers,
+                num_decoder_layers=cfg.model.num_decoder_layers,
+                dim_feedforward=cfg.model.dim_feedforward,
+                dropout=cfg.model.dropout
+            ).to(self.device)
         
         # Optimizer and scheduler
         self.optimizer = optim.Adam(
@@ -472,42 +535,67 @@ class ACTTrainer:
         logger.info(f"Train samples: {len(self.train_dataset)}")
         logger.info(f"Val samples: {len(self.val_dataset)}")
     
+    def _worker_init_fn(self, worker_id):
+        """Initialize worker processes for DataLoader multiprocessing.
+        
+        This function disables timers in worker processes to avoid CUDA issues,
+        while keeping them enabled in the main process.
+        """
+        # Disable timers in worker processes to avoid CUDA synchronization issues
+        set_timing_enabled(False)
+    
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0
         total_acc = 0
         num_batches = 0
+    
+        dataloader_iter = iter(self.train_loader)
+        pbar = tqdm(range(len(self.train_loader)), desc=f"Epoch {epoch+1} Training")
         
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} Training")
-        for batch_idx, batch in enumerate(pbar):
-            observations = batch['observations'].to(self.device)  # (B, num_levels, 4, H, W)
-            actions = batch['actions'].to(self.device)  # (B, chunk_size)
-            mask = batch['mask'].to(self.device)  # (B, chunk_size)
+        for batch_idx in pbar:
+            
+            with get_timer("fetch_data"):
+                batch = next(dataloader_iter)
+
+            with get_timer("data_to_device"):
+                # Transfer dictionary of observations to device
+                observations = batch['observations']
+                observations = {
+                    'image': observations['image'].to(self.device),
+                    'state': observations['state'].to(self.device)
+                }
+                actions = batch['actions'].to(self.device)  # (B, chunk_size)
+                mask = batch['mask'].to(self.device)  # (B, chunk_size)
             
             self.optimizer.zero_grad()
             
             # Forward pass
-            logits = self.model(observations, actions, mask)  # (B, chunk_size, action_dim)
+            with get_timer("forward_pass"):
+                logits = self.model(observations, actions, mask)  # (B, chunk_size, action_dim)
             
             # Compute loss (only on non-padded positions)
-            loss = self.criterion(
-                logits.reshape(-1, logits.size(-1)),  # (B * chunk_size, action_dim) 
-                actions.reshape(-1)  # (B * chunk_size,)
-            )
-            loss = loss.reshape(actions.shape)  # (B, chunk_size)
-            
-            # Apply mask and average
-            valid_loss = (loss * mask.float()).sum() / mask.sum()
+            with get_timer("loss_computation"):
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)),  # (B * chunk_size, action_dim) 
+                    actions.reshape(-1)  # (B * chunk_size,)
+                )
+                loss = loss.reshape(actions.shape)  # (B, chunk_size)
+                
+                # Apply mask and average
+                valid_loss = (loss * mask.float()).sum() / mask.sum()
             
             # Backward pass
-            valid_loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            with get_timer("backward_pass"):
+                valid_loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
             
             # Calculate accuracy
-            pred_actions = torch.argmax(logits, dim=-1)
-            correct = (pred_actions == actions) * mask
-            accuracy = correct.sum().float() / mask.sum()
+            with get_timer("accuracy_computation"):
+                pred_actions = torch.argmax(logits, dim=-1)
+                correct = (pred_actions == actions) * mask
+                accuracy = correct.sum().float() / mask.sum()
             
             total_loss += valid_loss.item()
             total_acc += accuracy.item()
@@ -520,11 +608,13 @@ class ACTTrainer:
             })
             
             # Log to tensorboard
-            global_step = epoch * len(self.train_loader) + batch_idx
-            self.writer.add_scalar('train/loss', valid_loss.item(), global_step)
-            self.writer.add_scalar('train/accuracy', accuracy.item(), global_step)
-            self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], global_step)
-        
+            with get_timer("tensorboard_logging"):
+                global_step = epoch * len(self.train_loader) + batch_idx
+                self.writer.add_scalar('train/loss', valid_loss.item(), global_step)
+                self.writer.add_scalar('train/accuracy', accuracy.item(), global_step)
+                self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], global_step)
+
+            print_timing_report()
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches
         
@@ -538,37 +628,53 @@ class ACTTrainer:
         total_acc = 0
         num_batches = 0
         
-        with torch.no_grad():
-            pbar = tqdm(self.val_loader, desc=f"Epoch {epoch+1} Validation")
-            for batch in pbar:
-                observations = batch['observations'].to(self.device)
-                actions = batch['actions'].to(self.device)
-                mask = batch['mask'].to(self.device)
+        with get_timer(f"val_epoch_{epoch}"):
+            with torch.no_grad():
+                dataloader_iter = iter(self.val_loader)
+                pbar = tqdm(range(len(self.val_loader)), desc=f"Epoch {epoch+1} Validation")
                 
-                # Forward pass
-                logits = self.model(observations, actions, mask)
-                
-                # Compute loss
-                loss = self.criterion(
-                    logits.reshape(-1, logits.size(-1)),
-                    actions.reshape(-1)
-                )
-                loss = loss.reshape(actions.shape)
-                valid_loss = (loss * mask.float()).sum() / mask.sum()
-                
-                # Calculate accuracy
-                pred_actions = torch.argmax(logits, dim=-1)
-                correct = (pred_actions == actions) * mask
-                accuracy = correct.sum().float() / mask.sum()
-                
-                total_loss += valid_loss.item()
-                total_acc += accuracy.item()
-                num_batches += 1
-                
-                pbar.set_postfix({
-                    'loss': f"{valid_loss.item():.4f}",
-                    'acc': f"{accuracy.item():.3f}"
-                })
+                for batch_idx in pbar:
+                    with get_timer("val_batch_processing"):
+                        
+                        batch = next(dataloader_iter)
+                        
+                        with get_timer("val_data_transfer"):
+                            # Transfer dictionary of observations to device
+                            observations = batch['observations']
+                            observations = {
+                                'image': observations['image'].to(self.device),
+                                'state': observations['state'].to(self.device)
+                            }
+                            actions = batch['actions'].to(self.device)
+                            mask = batch['mask'].to(self.device)
+                        
+                        # Forward pass
+                        with get_timer("val_forward_pass"):
+                            logits = self.model(observations, actions, mask)
+                        
+                        # Compute loss
+                        with get_timer("val_loss_computation"):
+                            loss = self.criterion(
+                                logits.reshape(-1, logits.size(-1)),
+                                actions.reshape(-1)
+                            )
+                            loss = loss.reshape(actions.shape)
+                            valid_loss = (loss * mask.float()).sum() / mask.sum()
+                        
+                        # Calculate accuracy
+                        with get_timer("val_accuracy_computation"):
+                            pred_actions = torch.argmax(logits, dim=-1)
+                            correct = (pred_actions == actions) * mask
+                            accuracy = correct.sum().float() / mask.sum()
+                        
+                        total_loss += valid_loss.item()
+                        total_acc += accuracy.item()
+                        num_batches += 1
+                        
+                        pbar.set_postfix({
+                            'loss': f"{valid_loss.item():.4f}",
+                            'acc': f"{accuracy.item():.3f}"
+                        })
         
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches
@@ -640,9 +746,12 @@ class ACTTrainer:
 
 @hydra.main(version_base=None, config_path=".", config_name="act_config")
 def main(cfg: DictConfig):
-    # Set random seeds
-    torch.manual_seed(42)
-    np.random.seed(42)
+
+    if not os.path.exists(cfg.data.h5_file_path):
+        print(f"ERROR: Data file not found at {cfg.data.h5_file_path}")
+        print("Please make sure you have recorded human demonstration data first.")
+        print("Run: python human_player.py")
+        return
     
     # Create trainer and start training
     trainer = ACTTrainer(cfg)

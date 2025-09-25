@@ -246,12 +246,11 @@ class HierarchicalTimerManager:
             if current_stack:
                 current_stack.pop()
     
-    def print_report(self, title: str = "Hierarchical Timing Report", show_exclusive: bool = True):
+    def print_report(self, title: str = "Hierarchical Timing Report"):
         """Print a hierarchical timing report for all timers.
         
         Args:
             title: Title for the report
-            show_exclusive: Whether to show exclusive timing columns
         """
         if not self.enabled:
             return
@@ -260,14 +259,9 @@ class HierarchicalTimerManager:
         print(f"{title:^100}")
         print(f"{'='*100}")
         
-        if show_exclusive:
-            header = f"{'Timer Path':<50} {'Avg Inc(ms)':<12} {'Avg Exc(ms)':<12} {'Total Inc(ms)':<14} {'Total Exc(ms)':<14} {'Count':<8}"
-            print(header)
-            print(f"{'-'*100}")
-        else:
-            header = f"{'Timer Path':<50} {'Avg (ms)':<12} {'Total (ms)':<14} {'Count':<8}"
-            print(header)
-            print(f"{'-'*100}")
+        header = f"{'Timer Path':<40} {'Avg Inc(ms)':<12} {'Avg Exc(ms)':<12} {'Total Inc(ms)':<14} {'Total Exc(ms)':<14} {'Count':<8}"
+        print(header)
+        print(f"{'-'*100}")
         
         # Process root nodes in their natural order (no sorting)
         root_nodes = list(self.root_nodes.values())
@@ -282,7 +276,7 @@ class HierarchicalTimerManager:
         for root in root_nodes:
             if root.count == 0:
                 continue
-            self._print_tree_node(root, 0, show_exclusive)
+            self._print_tree_node(root, 0)
             
             # Add to totals (only root nodes)
             total_avg_inclusive += root.get_average_ms()
@@ -292,13 +286,10 @@ class HierarchicalTimerManager:
             total_count += root.count
         
         print(f"{'-'*100}")
-        if show_exclusive:
-            print(f"{'ROOT TOTALS':<50} {total_avg_inclusive:<12.3f} {total_avg_exclusive:<12.3f} {total_total_inclusive:<14.3f} {total_total_exclusive:<14.3f} {total_count:<8}")
-        else:
-            print(f"{'ROOT TOTALS':<50} {total_avg_inclusive:<12.3f} {total_total_inclusive:<14.3f} {total_count:<8}")
+        print(f"{'ROOT TOTALS':<40} {total_avg_inclusive:>12.3f} {total_avg_exclusive:>12.3f} {total_total_inclusive:>14.3f} {total_total_exclusive:>14.3f} {total_count:>8}")
         print(f"{'='*100}\n")
     
-    def _print_tree_node(self, node: 'TimerNode', depth: int, show_exclusive: bool):
+    def _print_tree_node(self, node: 'TimerNode', depth: int):
         """Print a timer node and its children recursively with proper indentation."""
         indent = "  " * depth
         display_name = f"{indent}{node.name}"
@@ -309,15 +300,19 @@ class HierarchicalTimerManager:
         total_exc_ms = node.get_exclusive_total_ms()
         count = node.count
         
-        if show_exclusive:
-            print(f"{display_name:<50} {avg_inc_ms:>12.3f} {avg_exc_ms:>12.3f} {total_inc_ms:>14.3f} {total_exc_ms:>14.3f} {count:>8}")
+        # Check if this is a leaf node (no children)
+        is_leaf = len(node.children) == 0
+    
+        if is_leaf:
+            # For leaf nodes, exclusive time is meaningless, so print "-"
+            print(f"{display_name:<40} {avg_inc_ms:>12.3f} {'-':>12} {total_inc_ms:>14.3f} {'-':>14} {count:>8}")
         else:
-            print(f"{display_name:<50} {avg_inc_ms:>12.3f} {total_inc_ms:>14.3f} {count:>8}")
+            print(f"{display_name:<40} {avg_inc_ms:>12.3f} {avg_exc_ms:>12.3f} {total_inc_ms:>14.3f} {total_exc_ms:>14.3f} {count:>8}")
 
         # Print children recursively
         for child in node.children.values():
             if child.count > 0:
-                self._print_tree_node(child, depth + 1, show_exclusive)
+                self._print_tree_node(child, depth + 1)
     
     def reset_all(self):
         """Reset all timers and clear the entire tree structure."""
@@ -355,9 +350,9 @@ def get_timer(name: str):
     return global_timer_manager.get_timer(name)
 
 
-def print_timing_report(title: str = "Hierarchical Timing Report", show_exclusive: bool = True):
+def print_timing_report(title: str = "Hierarchical Timing Report"):
     """Convenience function to print hierarchical timing report from global manager."""
-    global_timer_manager.print_report(title, show_exclusive)
+    global_timer_manager.print_report(title)
 
 
 def reset_timer():

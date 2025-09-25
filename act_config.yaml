@@ -2,7 +2,7 @@
 
 # Data settings
 data:
-  h5_file_path: "human_data/human_data_clean.h5"
+  h5_file_path: "human_data/human_data.h5"
   train_split: 0.8
 
 # Model architecture
@@ -29,6 +29,9 @@ logging:
   log_dir: "runs/act_flatland"
   save_dir: "checkpoints/act_flatland" 
   save_interval: 10  # Save checkpoint every N epochs
+
+# Performance monitoring
+enable_timer: false  # Enable detailed timing reports
 
 # Hydra settings
 hydra:

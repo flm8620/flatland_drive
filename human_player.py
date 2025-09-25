@@ -47,8 +47,8 @@ class HumanPlayer:
         self.small_font = pygame.font.Font(None, 14)
 
 
-        min_start_goal_dist = 10.0
-        max_start_goal_dist = 200.0
+        min_start_goal_dist = 100.0
+        max_start_goal_dist = 400.0
         
         # Create single environment (num_envs=1)
         self.env = ParallelDrivingEnv(
@@ -86,16 +86,18 @@ class HumanPlayer:
             "Up-Left",       # 8: (-1/√2, 1/√2)
         ]
         
-        # Key to action mapping
+        # Key to action mapping - WASD with combinations (corrected for inverted Y axis)
         self.key_to_action = {
-            pygame.K_x: 1,      # Up
-            pygame.K_c: 2,      # Up-Right
-            pygame.K_d: 3,      # Right
-            pygame.K_e: 4,      # Down-Right
-            pygame.K_w: 5,      # Down
-            pygame.K_q: 6,      # Down-Left
-            pygame.K_a: 7,      # Left
-            pygame.K_z: 8,      # Up-Left
+            # Single keys - corrected for pygame screen coordinates vs environment coordinates
+            (pygame.K_w,): 5,           # Up on screen (W moves up visually, maps to action 5)
+            (pygame.K_d,): 3,           # Right (D) 
+            (pygame.K_s,): 1,           # Down on screen (S moves down visually, maps to action 1)
+            (pygame.K_a,): 7,           # Left (A)
+            # Key combinations for diagonal movement - corrected
+            (pygame.K_w, pygame.K_d): 4,  # Up-Right on screen (W+D: up visually + right)
+            (pygame.K_s, pygame.K_d): 2,  # Down-Right on screen (S+D: down visually + right)
+            (pygame.K_s, pygame.K_a): 8,  # Down-Left on screen (S+A: down visually + left)
+            (pygame.K_w, pygame.K_a): 6,  # Up-Left on screen (W+A: up visually + left)
         }
         
         # Game state
@@ -135,7 +137,7 @@ class HumanPlayer:
         
         print("Human Player initialized!")
         print("Controls:")
-        print("  W/A/S/D/Q/E/Z/C - Movement")
+        print("  WASD - Movement (combine for diagonals, e.g. W+A for up-left)")
         print("  R - Start/Stop Recording")
         print("  SPACE - Reset Environment")
         print("  ESC - Quit")
@@ -146,21 +148,26 @@ class HumanPlayer:
         if hasattr(obs_level, 'cpu'):
             obs_level = obs_level.cpu().numpy()
         
-        cost = obs_level[0]
-        vel_x = obs_level[1]
-        vel_y = obs_level[2]
-        target_map = obs_level[3]
+        # New format: only 2 channels (cost + target)
+        cost = obs_level[0]  # uint8 values: 0 (drivable) or 255 (wall)
+        target_map = obs_level[1]  # uint8 values: 0 (no target), 128 (agent center), 255 (goal)
         
         # Create RGB image
-        # Cost channel: -1 (drivable) = black, 1+ (wall) = white
-        cost_norm = np.clip((cost + 1) / 2, 0, 1)  # -1..1 -> 0..1
+        # Cost channel: 0 (drivable) = black, 255 (wall) = white
+        cost_norm = cost.astype(np.float32) / 255.0  # 0..255 -> 0..1
         img = np.stack([cost_norm, cost_norm, cost_norm], axis=-1)
         
-        # Overlay target as magenta
-        target_mask = target_map > 0.5
-        img[target_mask, 0] = 1.0  # Red
-        img[target_mask, 1] = 0.0  # Green
-        img[target_mask, 2] = 1.0  # Blue
+        # Overlay target as magenta (goal) and green (agent center)
+        goal_mask = target_map == 255
+        agent_mask = target_map == 128
+        
+        img[goal_mask, 0] = 1.0  # Red for goal
+        img[goal_mask, 1] = 0.0  # Green
+        img[goal_mask, 2] = 1.0  # Blue for goal -> magenta
+        
+        img[agent_mask, 0] = 0.0  # Red for agent center
+        img[agent_mask, 1] = 1.0  # Green for agent center -> green
+        img[agent_mask, 2] = 0.0  # Blue
         
         # Convert to 0-255 range
         img = (img * 255).astype(np.uint8)
@@ -173,20 +180,22 @@ class HumanPlayer:
         surface = pygame.surfarray.make_surface(img.transpose(1, 0, 2))
         return surface
     
-    def draw_level_info(self, surface, level_idx, obs_level):
+    def draw_level_info(self, surface, level_idx, state_obs):
         """Draw information overlay on a level surface"""
-        if hasattr(obs_level, 'cpu'):
-            obs_level = obs_level.cpu().numpy()
+        if hasattr(state_obs, 'cpu'):
+            state_obs = state_obs.cpu().numpy()
         
-        vel_x = obs_level[1, self.view_size//2, self.view_size//2]
-        vel_y = obs_level[2, self.view_size//2, self.view_size//2]
+        vel_x = state_obs[0]  # Normalized velocity x
+        vel_y = state_obs[1]  # Normalized velocity y
         
         # Draw level number
         text = self.small_font.render(f"Level {level_idx}", True, self.WHITE)
         surface.blit(text, (5, 5))
         
-        # Draw velocity info
-        vel_text = f"Vel: ({vel_x:.2f}, {vel_y:.2f})"
+        # Draw velocity info (denormalized)
+        vel_actual_x = vel_x * self.cfg.env.v_max
+        vel_actual_y = vel_y * self.cfg.env.v_max
+        vel_text = f"Vel: ({vel_actual_x:.2f}, {vel_actual_y:.2f})"
         text = self.small_font.render(vel_text, True, self.WHITE)
         surface.blit(text, (5, 25))
         
@@ -195,12 +204,9 @@ class HumanPlayer:
         pygame.draw.circle(surface, self.GREEN, (cx, cy), 4, 2)
         
         # Draw velocity vector
-        vel = np.array([vel_x, vel_y]) * self.cfg.env.v_max
-        vel_norm = np.linalg.norm(vel)
-        if vel_norm > 1e-3:
-            vel_dir = vel / vel_norm
-            vel_len = int(vel_norm / self.cfg.env.v_max * 30)  # Scale for visualization
-            tip = (int(cx + vel_dir[0] * vel_len), int(cy + vel_dir[1] * vel_len))
+        vel_len = int(np.sqrt(vel_x**2 + vel_y**2) * 30)  # Scale for visualization
+        if vel_len > 1:
+            tip = (int(cx + vel_x * 30), int(cy + vel_y * 30))
             pygame.draw.line(surface, self.YELLOW, (cx, cy), tip, 2)
             # Arrow tip
             pygame.draw.circle(surface, self.YELLOW, tip, 3)
@@ -256,7 +262,8 @@ class HumanPlayer:
         # Controls
         draw_text("=== Controls ===", self.BLACK)
         controls = [
-            "W/A/S/D/Q/E/Z/C: Move",
+            "WASD: Move",
+            "Combine for diagonals",
             "R: Toggle Recording",
             "SPACE: Reset",
             "ESC: Quit"
@@ -274,11 +281,33 @@ class HumanPlayer:
             self.screen.blit(surface, (panel_x + 10, y_offset))
     
     def get_pressed_action(self, keys):
-        """Get action from currently pressed keys"""
-        for key, action in self.key_to_action.items():
+        """Get action from currently pressed keys, supporting combinations"""
+        # Check for key combinations first (more specific)
+        pressed_movement_keys = []
+        movement_keys = [pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d]
+        
+        for key in movement_keys:
             if keys[key]:
+                pressed_movement_keys.append(key)
+        
+        if not pressed_movement_keys:
+            return 0  # No action
+        
+        # Sort keys for consistent comparison
+        pressed_tuple = tuple(sorted(pressed_movement_keys))
+        
+        # Try to find exact combination match
+        for key_combo, action in self.key_to_action.items():
+            if tuple(sorted(key_combo)) == pressed_tuple:
                 return action
-        return 0  # No action
+        
+        # If more than 2 keys pressed or invalid combination, take first valid single key
+        if len(pressed_movement_keys) > 2:
+            for key in pressed_movement_keys:
+                if (key,) in self.key_to_action:
+                    return self.key_to_action[(key,)]
+        
+        return 0  # No valid action found
     
     def reset_environment(self):
         """Reset the environment for a new episode"""
@@ -304,34 +333,34 @@ class HumanPlayer:
         """Append to existing HDF5 file"""
         self.hdf5_file = h5py.File(self.hdf5_filename, 'a')  # Open in append mode
         
-        # Verify file structure is compatible
-        required_datasets = ['observations', 'actions', 'rewards', 'episodes']
+        # Verify file structure is compatible (new format with separate image/state)
+        required_datasets = ['obs_images', 'obs_states', 'actions', 'rewards', 'episodes']
         for dataset_name in required_datasets:
             if dataset_name not in self.hdf5_file:
                 raise ValueError(f"Existing HDF5 file missing required dataset: {dataset_name}")
         
-        # Check compatibility of observation shape
-        obs_shape = (self.num_levels, 4, self.view_size, self.view_size)
-        existing_obs_shape = self.hdf5_file['observations'].shape[1:]
-        if existing_obs_shape != obs_shape:
-            raise ValueError(f"Observation shape mismatch: existing {existing_obs_shape} vs required {obs_shape}")
+        # Check compatibility of observation shapes
+        image_shape = (self.num_levels, 2, self.view_size, self.view_size)  # uint8 images
+        state_shape = (2,)  # float32 velocity
+        
+        existing_image_shape = self.hdf5_file['obs_images'].shape[1:]
+        existing_state_shape = self.hdf5_file['obs_states'].shape[1:]
+        
+        if existing_image_shape != image_shape:
+            raise ValueError(f"Image observation shape mismatch: existing {existing_image_shape} vs required {image_shape}")
+        if existing_state_shape != state_shape:
+            raise ValueError(f"State observation shape mismatch: existing {existing_state_shape} vs required {state_shape}")
         
         # Get existing datasets
-        self.obs_dataset = self.hdf5_file['observations']
+        self.obs_images_dataset = self.hdf5_file['obs_images']
+        self.obs_states_dataset = self.hdf5_file['obs_states']
         self.actions_dataset = self.hdf5_file['actions']
         self.rewards_dataset = self.hdf5_file['rewards']
         self.episodes_dataset = self.hdf5_file['episodes']
         
         # Get current counts from existing data
-        self.total_steps_recorded = self.hdf5_file.attrs.get('total_steps', len(self.obs_dataset))
+        self.total_steps_recorded = self.hdf5_file.attrs.get('total_steps', len(self.obs_images_dataset))
         self.episode_count = self.hdf5_file.attrs.get('total_episodes', len(self.episodes_dataset))
-        
-        # Trim datasets to actual size (in case they were pre-allocated larger)
-        if self.total_steps_recorded > 0:
-            current_step_size = self.obs_dataset.shape[0]
-            if self.total_steps_recorded < current_step_size:
-                # Dataset is larger than actual data, but we keep it for efficiency
-                pass
         
         print(f"Appending to existing file - Current: {self.episode_count} episodes, {self.total_steps_recorded} steps")
     
@@ -340,22 +369,32 @@ class HumanPlayer:
         # Estimate initial size (can be resized later)
         initial_episodes = 1000
         initial_steps = 100000  # Estimate steps per episode * episodes
-        obs_shape = (self.num_levels, 4, self.view_size, self.view_size)
+        image_shape = (self.num_levels, 2, self.view_size, self.view_size)  # uint8 images
+        state_shape = (2,)  # float32 velocity
         
         self.hdf5_file = h5py.File(self.hdf5_filename, 'w')
         
-        # Create datasets with chunking for efficient random access
-        chunk_size = 1000  # Number of steps per chunk
+        # Create datasets with chunk_size = 1 for random access
+        chunk_size = 1  # Number of steps per chunk
         
-        # Observations: [total_steps, num_levels, 4, view_size, view_size]
-        self.obs_dataset = self.hdf5_file.create_dataset(
-            'observations', 
-            shape=(initial_steps, *obs_shape),
-            maxshape=(None, *obs_shape),  # Unlimited in first dimension
-            dtype=np.float32,
-            chunks=(chunk_size, *obs_shape),
-            compression='gzip',
+        # Image observations: [total_steps, num_levels, 2, view_size, view_size] uint8
+        self.obs_images_dataset = self.hdf5_file.create_dataset(
+            'obs_images', 
+            shape=(initial_steps, *image_shape),
+            maxshape=(None, *image_shape),  # Unlimited in first dimension
+            dtype=np.uint8,
+            chunks=(chunk_size, *image_shape),
+            compression='gzip',  # Only compress image data
             compression_opts=1  # Light compression for speed
+        )
+        
+        # State observations: [total_steps, 2] float32
+        self.obs_states_dataset = self.hdf5_file.create_dataset(
+            'obs_states',
+            shape=(initial_steps, *state_shape),
+            maxshape=(None, *state_shape),
+            dtype=np.float32,
+            chunks=(chunk_size, *state_shape)  # No compression for state data
         )
         
         # Actions: [total_steps]
@@ -364,9 +403,7 @@ class HumanPlayer:
             shape=(initial_steps,),
             maxshape=(None,),
             dtype=np.int32,
-            chunks=(chunk_size,),
-            compression='gzip',
-            compression_opts=1
+            chunks=(chunk_size,)  # No compression
         )
         
         # Rewards: [total_steps]
@@ -375,9 +412,7 @@ class HumanPlayer:
             shape=(initial_steps,),
             maxshape=(None,),
             dtype=np.float32,
-            chunks=(chunk_size,),
-            compression='gzip',
-            compression_opts=1
+            chunks=(chunk_size,)  # No compression
         )
         
         # Episode metadata: [num_episodes]
@@ -416,10 +451,11 @@ class HumanPlayer:
             return
         
         # Check and resize step datasets
-        current_steps = self.obs_dataset.shape[0]
+        current_steps = self.obs_images_dataset.shape[0]
         if required_steps > current_steps:
             new_size = max(required_steps, int(current_steps * 1.5))
-            self.obs_dataset.resize((new_size, *self.obs_dataset.shape[1:]))
+            self.obs_images_dataset.resize((new_size, *self.obs_images_dataset.shape[1:]))
+            self.obs_states_dataset.resize((new_size, *self.obs_states_dataset.shape[1:]))
             self.actions_dataset.resize((new_size,))
             self.rewards_dataset.resize((new_size,))
         
@@ -434,13 +470,29 @@ class HumanPlayer:
         if not episode_data or self.hdf5_file is None:
             return
         
-        observations = episode_data['observations']
+        observations = episode_data['observations']  # List of TensorDict observations
         actions = episode_data['actions']
         rewards = episode_data['rewards']
         episode_length = len(observations)
         
-        # Convert observations to numpy array
-        obs_array = torch.stack(observations).cpu().numpy()  # [episode_length, num_levels, 4, view_size, view_size]
+        # Skip episodes that are too short (likely corrupted or accidental)
+        min_episode_length = 30
+        if episode_length < min_episode_length:
+            print(f"Skipping short episode with only {episode_length} steps (minimum: {min_episode_length})")
+            return
+        
+        # Extract image and state components separately
+        obs_images = []
+        obs_states = []
+        
+        for obs_dict in observations:
+            # obs_dict is a TensorDict with 'image' and 'state'
+            obs_images.append(obs_dict['image'])  # (num_levels, 2, view_size, view_size) uint8
+            obs_states.append(obs_dict['state'])  # (2,) float32
+        
+        # Convert to numpy arrays
+        obs_images_array = torch.stack(obs_images).cpu().numpy().astype(np.uint8)  # [episode_length, num_levels, 2, view_size, view_size]
+        obs_states_array = torch.stack(obs_states).cpu().numpy().astype(np.float32)  # [episode_length, 2]
         actions_array = np.array(actions, dtype=np.int32)
         rewards_array = np.array(rewards, dtype=np.float32)
         
@@ -453,7 +505,8 @@ class HumanPlayer:
         start_idx = self.total_steps_recorded
         end_idx = start_idx + episode_length
         
-        self.obs_dataset[start_idx:end_idx] = obs_array
+        self.obs_images_dataset[start_idx:end_idx] = obs_images_array
+        self.obs_states_dataset[start_idx:end_idx] = obs_states_array
         self.actions_dataset[start_idx:end_idx] = actions_array
         self.rewards_dataset[start_idx:end_idx] = rewards_array
         
@@ -493,7 +546,8 @@ class HumanPlayer:
             
             # Trim datasets to actual size
             if self.total_steps_recorded > 0:
-                self.obs_dataset.resize((self.total_steps_recorded, *self.obs_dataset.shape[1:]))
+                self.obs_images_dataset.resize((self.total_steps_recorded, *self.obs_images_dataset.shape[1:]))
+                self.obs_states_dataset.resize((self.total_steps_recorded, *self.obs_states_dataset.shape[1:]))
                 self.actions_dataset.resize((self.total_steps_recorded,))
                 self.rewards_dataset.resize((self.total_steps_recorded,))
             
@@ -530,8 +584,11 @@ class HumanPlayer:
                                 'episode_reward': sum(step['reward'] for step in self.current_episode_data),
                                 'episode_length': len(self.current_episode_data)
                             }
-                            self.episode_count += 1
+                            # Only increment count if episode was actually saved (not skipped for being too short)
+                            episode_length_before = len(self.current_episode_data)
                             self.save_episode_data(episode_data)
+                            if episode_length_before >= 30:  # Episode was saved
+                                self.episode_count += 1
                             self.current_episode_data = []
                         
                         self.reset_environment()
@@ -608,9 +665,12 @@ class HumanPlayer:
             # Draw observation levels
             if self.obs is not None:
                 for level_idx in range(self.num_levels):
-                    obs_level = self.obs[0, level_idx]  # [0] for first (and only) env
-                    surface = self.obs_level_to_pygame_surface(obs_level)
-                    self.draw_level_info(surface, level_idx, obs_level)
+                    # Extract image and state from TensorDict observation
+                    obs_image_level = self.obs['image'][0, level_idx]  # [0] for first env, image for this level
+                    obs_state = self.obs['state'][0]  # [0] for first env, state vector
+                    
+                    surface = self.obs_level_to_pygame_surface(obs_image_level)
+                    self.draw_level_info(surface, level_idx, obs_state)
                     
                     x_pos = level_idx * self.level_display_size
                     

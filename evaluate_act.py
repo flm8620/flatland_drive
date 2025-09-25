@@ -12,7 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 import cv2
 from tqdm import tqdm
 
-from flatland_act import FlatlandACT, create_act_config
+from flatland_act import FlatlandACT
 from env import ParallelDrivingEnv, get_human_frame
 
 
@@ -57,7 +57,7 @@ class ACTAgent:
         Uses action chunking - predicts multiple actions at once and queues them.
         
         Args:
-            observation: (num_levels, 4, view_size, view_size) tensor
+            observation: Dictionary with 'image' and 'state' keys
             
         Returns:
             action: integer action index
@@ -68,7 +68,12 @@ class ACTAgent:
         
         # Generate new action chunk
         with torch.no_grad():
-            obs_batch = observation.unsqueeze(0).to(self.device)  # Add batch dim
+            # Add batch dimension and move to device (plain dict)
+            obs_batch = {
+                'image': observation['image'].unsqueeze(0).to(self.device),
+                'state': observation['state'].unsqueeze(0).to(self.device)
+            }
+            
             actions = self.model.generate(obs_batch)  # (1, chunk_size)
             action_list = actions[0].cpu().tolist()  # Convert to list
         
@@ -134,8 +139,8 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
         frames = []
         
         while not done:
-            # Get action from agent
-            action = agent.predict_action(obs[0])  # obs is (1, num_levels, 4, H, W)
+            # Get action from agent - obs is now TensorDict format
+            action = agent.predict_action(obs[0])  # obs[0] is TensorDict with 'image' and 'state'
             
             # Step environment
             obs, reward, terminated, truncated, info = env.step(torch.tensor([action]))
@@ -147,8 +152,11 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
             # Render frame if requested
             if render:
                 # Convert observation to human viewable format
+                # Need to reconstruct compatible format for get_human_frame
+                # Combine image and state for visualization
+                obs_single = obs[0]  # TensorDict for single environment
                 frame = get_human_frame(
-                    obs[0].cpu(),  # Single environment observation
+                    obs_single,  # Pass TensorDict directly
                     info['vel'][0].cpu(),  # Velocity
                     cfg.env.v_max,
                     action=action,

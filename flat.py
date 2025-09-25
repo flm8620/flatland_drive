@@ -536,7 +536,7 @@ def train(cfg: DictConfig):
         print(f"[INFO] Rollout {rollout_idx}: Network update took {update_time:.3f} s.")
         print(f"[INFO] Rollout {rollout_idx}: TotalTime: {total_rollout_time:.3f} s\n")
         if cfg.enable_timer:
-            print_timing_report(title=f"Timing Report after Rollout {rollout_idx}", show_exclusive=True)
+            print_timing_report(title=f"Timing Report after Rollout {rollout_idx}")
         if rollout_idx % cfg.train.save_every == 0:
             torch.save(actor.state_dict(),
                        os.path.join(run_dir, f"actor_ep{rollout_idx}.pth"))
