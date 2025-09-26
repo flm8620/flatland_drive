@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.autograd import Variable
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -23,9 +24,19 @@ from omegaconf import DictConfig, OmegaConf
 # Import timer utilities
 from timer import get_timer, set_timing_enabled, reset_timer, print_timing_report
 
+# Import proper ViT with RoPE
+from vit_rope import ViTSpatialEncoder
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def reparametrize(mu, logvar):
+    """Reparameterization trick for VAE"""
+    std = logvar.div(2).exp()
+    eps = Variable(std.data.new(std.size()).normal_())
+    return mu + std * eps
 
 
 class FlatlandDataset(Dataset):
@@ -137,91 +148,11 @@ def get_sinusoid_encoding_table(n_position, d_hid):
     return torch.FloatTensor(sinusoid_table).unsqueeze(0)
 
 
-class MultiScaleObsEncoder(nn.Module):
-    """Encoder for multi-scale observations from the Flatland environment."""
-    
-    def __init__(self, num_levels: int = 3, view_size: int = 64, 
-                 feature_dim: int = 256, hidden_dim: int = 256):
-        super().__init__()
-        self.num_levels = num_levels
-        self.view_size = view_size
-        self.feature_dim = feature_dim
-        
-        # Individual encoders for each scale level
-        # Note: New format has 2 channels instead of 4 (cost + target maps)
-        self.level_encoders = nn.ModuleList()
-        for level in range(num_levels):
-            encoder = nn.Sequential(
-                # Input: (2, view_size, view_size) - cost map + target map
-                nn.Conv2d(2, 32, kernel_size=8, stride=4, padding=2),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), 
-                nn.ReLU(inplace=True),
-                nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-                nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d((4, 4)),  # Fixed spatial size
-                nn.Flatten(),  # 128 * 4 * 4 = 2048
-                nn.Linear(128 * 4 * 4, feature_dim),
-                nn.ReLU(inplace=True)
-            )
-            self.level_encoders.append(encoder)
-        
-        # State encoder for velocity information
-        self.state_encoder = nn.Sequential(
-            nn.Linear(2, 64),  # Input: (2,) velocity
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 128),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Fusion network to combine multi-scale features + state
-        fusion_input_dim = num_levels * feature_dim + 128  # Image features + state features
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True)
-        )
-        
-    def forward(self, obs_dict):
-        """
-        Args:
-            obs_dict: Dictionary with keys:
-                - 'image': (batch_size, num_levels, 2, view_size, view_size)
-                - 'state': (batch_size, 2) - velocity information
-        Returns:
-            features: (batch_size, hidden_dim)
-        """
-        with get_timer("obs_encoder_forward"):
-            images = obs_dict['image']
-            states = obs_dict['state']
-            batch_size = images.size(0)
-            
-            # Encode each level separately
-            level_features = []
-            with get_timer("level_encoding"):
-                for level in range(self.num_levels):
-                    level_input = images[:, level]  # (batch_size, 2, view_size, view_size)
-                    level_feat = self.level_encoders[level](level_input)  # (batch_size, feature_dim)
-                    level_features.append(level_feat)
-            
-            # Encode state information
-            state_features = self.state_encoder(states)  # (batch_size, 128)
-            
-            # Concatenate and fuse
-            with get_timer("feature_fusion"):
-                combined = torch.cat(level_features + [state_features], dim=1)  # (batch_size, fusion_input_dim)
-                output = self.fusion(combined)  # (batch_size, hidden_dim)
-            
-            return output
-
-
 class TransformerEncoderLayer(nn.Module):
-    """Standard transformer encoder layer"""
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+    """Simplified transformer encoder layer for ACT"""
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -231,19 +162,14 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        self.activation = F.relu if activation == "relu" else F.gelu
-        self.normalize_before = normalize_before
-
-    def forward(self, src, src_mask=None, src_key_padding_mask=None, pos=None):
+    def forward(self, src):
         # Self attention
-        q = k = src if pos is None else src + pos
-        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
+        src2, _ = self.self_attn(src, src, src)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         
         # Feed forward
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src2 = self.linear2(self.dropout(F.gelu(self.linear1(src))))
         src = src + self.dropout2(src2)
         src = self.norm2(src)
         
@@ -251,12 +177,11 @@ class TransformerEncoderLayer(nn.Module):
 
 
 class TransformerDecoderLayer(nn.Module):
-    """Standard transformer decoder layer"""
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
+    """Simplified transformer decoder layer for ACT"""
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -269,29 +194,21 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
 
-        self.activation = F.relu if activation == "relu" else F.gelu
-        self.normalize_before = normalize_before
-
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None,
-                tgt_key_padding_mask=None, memory_key_padding_mask=None,
-                pos=None, query_pos=None):
-        # Self attention on target sequence
-        q = k = tgt if query_pos is None else tgt + query_pos
-        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
+    def forward(self, tgt, memory, query_pos=None):
+        # Self attention on target sequence (no causal mask needed for ACT)
+        q = k = tgt + query_pos if query_pos is not None else tgt
+        tgt2, _ = self.self_attn(q, k, value=tgt)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         
         # Cross attention with memory
-        tgt2 = self.multihead_attn(query=tgt if query_pos is None else tgt + query_pos,
-                                   key=memory if pos is None else memory + pos,
-                                   value=memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+        query = tgt + query_pos if query_pos is not None else tgt
+        tgt2, _ = self.multihead_attn(query=query, key=memory, value=memory)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         
         # Feed forward
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt2 = self.linear2(self.dropout(F.gelu(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         
@@ -299,7 +216,7 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class FlatlandACT(nn.Module):
-    """ACT model adapted for Flatland navigation task"""
+    """ACT model adapted for Flatland navigation task with spatial features and optional CVAE"""
     
     def __init__(self, 
                  num_levels: int = 3,
@@ -311,29 +228,51 @@ class FlatlandACT(nn.Module):
                  num_encoder_layers: int = 4,
                  num_decoder_layers: int = 6,
                  dim_feedforward: int = 1024,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 spatial_size: int = 8,
+                 use_cvae: bool = True,
+                 latent_dim: int = 32):
         super().__init__()
         
         self.action_dim = action_dim
         self.chunk_size = chunk_size
         self.hidden_dim = hidden_dim
+        self.spatial_size = spatial_size
+        self.num_levels = num_levels
+        self.num_spatial_tokens = spatial_size * spatial_size  # 64 tokens for 8x8
+        self.use_cvae = use_cvae
+        self.latent_dim = latent_dim
         
-        # Observation encoder
-        self.obs_encoder = MultiScaleObsEncoder(
+        # ViT encoder for spatial features (image only)
+        self.vit_spatial_encoder = ViTSpatialEncoder(
+            view_size=view_size,
+            patch_size=view_size // spatial_size,  # Ensure we get spatial_size x spatial_size patches
+            in_channels=2,
+            embed_dim=hidden_dim,
+            depth=4,
+            heads=8,
+            mlp_ratio=4,
+            dropout=dropout,
             num_levels=num_levels,
-            view_size=view_size, 
-            feature_dim=hidden_dim//2,
-            hidden_dim=hidden_dim
+            use_2d_rope=True
         )
         
-        # Transformer encoder (for observations) - manual implementation to avoid built-in bugs
+        # State encoder for velocity information  
+        self.state_encoder = nn.Sequential(
+            nn.Linear(2, 64),  # Input: (2,) velocity
+            nn.ReLU(inplace=True),
+            nn.Linear(64, hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Transformer encoder (for observations)
         self.encoder_layers = nn.ModuleList([
             TransformerEncoderLayer(hidden_dim, nhead, dim_feedforward, dropout)
             for _ in range(num_encoder_layers)
         ])
         self.num_encoder_layers = num_encoder_layers
         
-        # Transformer decoder (for action sequence generation) - manual implementation
+        # Transformer decoder (for action sequence generation)
         self.decoder_layers = nn.ModuleList([
             TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout)
             for _ in range(num_decoder_layers)
@@ -343,92 +282,173 @@ class FlatlandACT(nn.Module):
         # Action queries (learnable embeddings for each position in action sequence)
         self.action_queries = nn.Parameter(torch.randn(chunk_size, hidden_dim))
         
-        # Positional encodings
+        # Positional encodings for action sequence (1D)
         self.register_buffer(
-            'pos_encoding', 
+            'action_pos_encoding', 
             get_sinusoid_encoding_table(chunk_size, hidden_dim)
         )
         
+        # CVAE components (optional)
+        if self.use_cvae:
+            # VAE encoder for learning latent action style from GT actions during training
+            self.cvae_encoder_layers = nn.ModuleList([
+                TransformerEncoderLayer(hidden_dim, nhead, dim_feedforward, dropout)
+                for _ in range(2)  # Smaller encoder for CVAE
+            ])
+            
+            # CLS token for CVAE encoder
+            self.cls_embed = nn.Parameter(torch.randn(1, hidden_dim))
+            
+            # Action embedding for CVAE encoder
+            self.action_embed = nn.Linear(action_dim, hidden_dim)
+            
+            # State embedding for CVAE encoder (to condition on current state)
+            self.cvae_state_embed = nn.Linear(2, hidden_dim)  # velocity state
+            
+            # Positional encoding for CVAE encoder (CLS + state + action_sequence)
+            self.register_buffer(
+                'cvae_pos_encoding',
+                get_sinusoid_encoding_table(1 + 1 + chunk_size, hidden_dim)  # [CLS, state, actions]
+            )
+            
+            # Latent projection (outputs mu and logvar)
+            self.latent_proj = nn.Linear(hidden_dim, latent_dim * 2)
+            
+            # Latent to hidden projection for decoder conditioning
+            self.latent_out_proj = nn.Linear(latent_dim, hidden_dim)
+        
         # Action head
         self.action_head = nn.Linear(hidden_dim, action_dim)
-        
-        # Initialize parameters
-        self.apply(self._init_weights)
-        
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Conv2d):
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
     
     def forward(self, observations, actions=None, mask=None):
         """
         Args:
             observations: Dictionary with 'image' and 'state' keys
-            actions: (batch_size, chunk_size) - ground truth actions for training
+            actions: (batch_size, chunk_size) - ground truth actions for training (required for CVAE)
             mask: (batch_size, chunk_size) - padding mask
             
         Returns:
             logits: (batch_size, chunk_size, action_dim)
+            latent_info: [mu, logvar] if using CVAE and training, else [None, None]
             
-        For training, actions should be provided.
+        For training with CVAE, actions should be provided.
         For inference, actions should be None.
         """
-        with get_timer("act_forward"):
-            # Get batch size from the observations dictionary
-            batch_size = observations['image'].size(0)
-            device = observations['image'].device
-            
-            # Encode observations
-            with get_timer("observation_encoding"):
-                obs_features = self.obs_encoder(observations)  # (batch_size, hidden_dim)
-            
-            # Add batch dimension and transpose for transformer: (1, batch_size, hidden_dim)
-            with get_timer("memory_preparation"):
-                memory = obs_features.unsqueeze(0)
+        # Get batch size from the observations dictionary
+        batch_size = observations['image'].size(0)
+        device = observations['image'].device
+        is_training = actions is not None
+        
+        # Initialize latent variables
+        mu, logvar = None, None
+        
+        # CVAE Encoder: Extract latent style from ground truth actions (training only)
+        if self.use_cvae:
+            with get_timer("cvae_encoding"):
+                if is_training:
+                    # Convert actions to one-hot and embed
+                    actions_onehot = F.one_hot(actions, num_classes=self.action_dim).float()  # (B, chunk_size, action_dim)
+                    action_embeddings = self.action_embed(actions_onehot)  # (B, chunk_size, hidden_dim)
+                    
+                    # Embed current state
+                    state_embedding = self.cvae_state_embed(observations['state']).unsqueeze(1)  # (B, 1, hidden_dim)
+                    
+                    # CLS token
+                    cls_token = self.cls_embed.unsqueeze(0).expand(batch_size, -1, -1)  # (B, 1, hidden_dim)
+                    
+                    # Concatenate: [CLS, state, action_sequence]
+                    cvae_input = torch.cat([cls_token, state_embedding, action_embeddings], dim=1)  # (B, 1+1+chunk_size, hidden_dim)
+                    
+                    # Add positional encoding
+                    pos_encoding = self.cvae_pos_encoding.expand(batch_size, -1, -1)  # (B, seq_len, hidden_dim)
+                    cvae_input = cvae_input + pos_encoding
+                    
+                    # Pass through CVAE encoder
+                    cvae_output = cvae_input
+                    for layer in self.cvae_encoder_layers:
+                        cvae_output = layer(cvae_output)
+                    
+                    # Extract CLS token output for latent projection
+                    cls_output = cvae_output[:, 0]  # (B, hidden_dim)
+                    
+                    # Project to latent space (mu and logvar)
+                    latent_info = self.latent_proj(cls_output)  # (B, latent_dim * 2)
+                    mu = latent_info[:, :self.latent_dim]
+                    logvar = latent_info[:, self.latent_dim:]
+                    
+                    # Reparameterization trick
+                    latent_sample = reparametrize(mu, logvar)  # (B, latent_dim)
+                else:
+                    # During inference, sample from prior (zero mean, unit variance)
+                    latent_sample = torch.zeros(batch_size, self.latent_dim, device=device)
                 
-                # Pass through encoder layers manually
-                for encoder_layer in self.encoder_layers:
-                    memory = encoder_layer(memory)  # (1, batch_size, hidden_dim)
-            
-            # Prepare action queries
-            with get_timer("query_preparation"):
-                # action_queries: (chunk_size, hidden_dim) -> (chunk_size, batch_size, hidden_dim)
-                tgt = self.action_queries.unsqueeze(1).repeat(1, batch_size, 1)
+                # Project latent to hidden dimension for decoder conditioning
+                latent_conditioning = self.latent_out_proj(latent_sample)  # (B, hidden_dim)
+        else:
+            latent_conditioning = None
+        
+        # Encode observations to spatial tokens and state features
+        with get_timer("observation_encoding"):
+            # Encode images to spatial tokens
+            with get_timer("vit_spatial_encoding"):
+                spatial_tokens = self.vit_spatial_encoder(observations['image'])  # (B, num_levels * num_patches, hidden_dim)
                 
-                # Add positional encoding to queries
-                query_pos = self.pos_encoding[0, :self.chunk_size].unsqueeze(1).repeat(1, batch_size, 1)
-                
-                # Generate causal mask for decoder (autoregressive generation)
-                tgt_mask = nn.Transformer.generate_square_subsequent_mask(self.chunk_size).to(device)
+                # Verify we get the expected number of spatial tokens (from all levels)
+                expected_tokens = self.num_levels * self.spatial_size * self.spatial_size
+                assert spatial_tokens.size(1) == expected_tokens, \
+                    f"Expected {expected_tokens} spatial tokens, got {spatial_tokens.size(1)}"
             
-            # Pass through decoder layers manually
-            with get_timer("decoder_forward"):
-                output = tgt
-                for decoder_layer in self.decoder_layers:
-                    output = decoder_layer(
-                        tgt=output,
-                        memory=memory,
-                        tgt_mask=tgt_mask,
-                        query_pos=query_pos
-                    )  # (chunk_size, batch_size, hidden_dim)
+            # Encode state information
+            with get_timer("state_encoding"):
+                state_features = self.state_encoder(observations['state'])  # (batch_size, hidden_dim)
+        
+        # Combine spatial and state tokens for memory
+        with get_timer("memory_preparation"):
+            # Add state as an additional token
+            state_token = state_features.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+            memory_tokens = [spatial_tokens, state_token]
             
-            # Transpose back: (batch_size, chunk_size, hidden_dim)
-            with get_timer("output_projection"):
-                output = output.transpose(0, 1)
-                
-                # Generate action logits
-                logits = self.action_head(output)  # (batch_size, chunk_size, action_dim)
+            # Add latent conditioning as an additional memory token if using CVAE 
+            if self.use_cvae:
+                latent_token = latent_conditioning.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+                memory_tokens.append(latent_token)
             
-            return logits
+            memory = torch.cat(memory_tokens, dim=1)  # (B, num_levels*spatial_size^2 + 1 + [latent], hidden_dim)
+            
+            # Pass through encoder layers
+            for encoder_layer in self.encoder_layers:
+                memory = encoder_layer(memory)  # (batch_size, memory_seq_len, hidden_dim)
+        
+        # Prepare action queries
+        with get_timer("query_preparation"):
+            # Expand action queries for batch: (batch_size, chunk_size, hidden_dim)
+            tgt = self.action_queries.unsqueeze(0).expand(batch_size, -1, -1)
+            
+            # Expand positional encoding for batch: (batch_size, chunk_size, hidden_dim)
+            pos_enc = self.action_pos_encoding.expand(batch_size, -1, -1)
+        
+        # Pass through decoder layers
+        with get_timer("decoder_forward"):
+            output = tgt
+            for decoder_layer in self.decoder_layers:
+                output = decoder_layer(
+                    tgt=output,
+                    memory=memory,
+                    query_pos=pos_enc
+                )  # (batch_size, chunk_size, hidden_dim)
+        
+        # Generate action logits (no transpose needed with batch_first=True)
+        with get_timer("output_projection"):
+            # Generate action logits
+            logits = self.action_head(output)  # (batch_size, chunk_size, action_dim)
+        
+        return logits, [mu, logvar]
     
     def generate(self, observations):
         """Generate actions for inference (non-autoregressive for now)"""
         self.eval()
         with torch.no_grad():
-            logits = self.forward(observations)
+            logits, _ = self.forward(observations)
             actions = torch.argmax(logits, dim=-1)  # (batch_size, chunk_size)
         return actions
 
@@ -502,7 +522,10 @@ class ACTTrainer:
                 num_encoder_layers=cfg.model.num_encoder_layers,
                 num_decoder_layers=cfg.model.num_decoder_layers,
                 dim_feedforward=cfg.model.dim_feedforward,
-                dropout=cfg.model.dropout
+                dropout=cfg.model.dropout,
+                spatial_size=cfg.model.spatial_size,
+                use_cvae=cfg.model.use_cvae,
+                latent_dim=cfg.model.latent_dim
             ).to(self.device)
         
         # Optimizer and scheduler
@@ -512,14 +535,28 @@ class ACTTrainer:
             weight_decay=cfg.training.weight_decay
         )
         
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=cfg.training.epochs,
-            eta_min=cfg.training.lr * 0.01
-        )
+        # Calculate warmup steps (typically 5-10% of total training steps)
+        warmup_epochs = max(1, int(cfg.training.epochs * 0.1))  # 10% of total epochs
+        total_steps = len(self.train_loader) * cfg.training.epochs
+        warmup_steps = len(self.train_loader) * warmup_epochs
+        
+        # Create warmup + cosine annealing scheduler
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup
+                return float(current_step) / float(max(1, warmup_steps))
+            else:
+                # Cosine annealing
+                progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                return 0.5 * (1.0 + np.cos(np.pi * progress)) * (1.0 - 0.01) + 0.01
+        
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         
         # Loss function
         self.criterion = nn.CrossEntropyLoss(reduction='none')  # Don't reduce yet
+        
+        # KL divergence weight for CVAE loss
+        self.kl_weight = cfg.training.kl_weight
         
         # Logging
         self.log_dir = cfg.logging.log_dir
@@ -546,7 +583,7 @@ class ACTTrainer:
     
     def train_epoch(self, epoch):
         self.model.train()
-        total_loss = 0
+        total_loss_accum = 0
         total_acc = 0
         num_batches = 0
     
@@ -572,24 +609,37 @@ class ACTTrainer:
             
             # Forward pass
             with get_timer("forward_pass"):
-                logits = self.model(observations, actions, mask)  # (B, chunk_size, action_dim)
+                logits, latent_info = self.model(observations, actions, mask)  # (B, chunk_size, action_dim)
+                mu, logvar = latent_info
             
-            # Compute loss (only on non-padded positions)
+            # Compute losses
             with get_timer("loss_computation"):
-                loss = self.criterion(
+                # Action prediction loss
+                action_loss = self.criterion(
                     logits.reshape(-1, logits.size(-1)),  # (B * chunk_size, action_dim) 
                     actions.reshape(-1)  # (B * chunk_size,)
                 )
-                loss = loss.reshape(actions.shape)  # (B, chunk_size)
+                action_loss = action_loss.reshape(actions.shape)  # (B, chunk_size)
                 
                 # Apply mask and average
-                valid_loss = (loss * mask.float()).sum() / mask.sum()
+                valid_action_loss = (action_loss * mask.float()).sum() / mask.sum()
+                
+                # KL divergence loss (only if using CVAE and during training)
+                total_loss = valid_action_loss
+                kl_loss = torch.tensor(0.0, device=self.device)
+                
+                if self.model.use_cvae:
+                    # KL divergence: -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+                    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+                    kl_loss = kl_loss.mean()  # Average over batch
+                    total_loss = valid_action_loss + self.kl_weight * kl_loss
             
             # Backward pass
             with get_timer("backward_pass"):
-                valid_loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                total_loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 self.optimizer.step()
+                self.scheduler.step()  # Update learning rate after each step
             
             # Calculate accuracy
             with get_timer("accuracy_computation"):
@@ -597,25 +647,29 @@ class ACTTrainer:
                 correct = (pred_actions == actions) * mask
                 accuracy = correct.sum().float() / mask.sum()
             
-            total_loss += valid_loss.item()
+            total_loss_accum += total_loss.item()
             total_acc += accuracy.item()
             num_batches += 1
             
             # Update progress bar
             pbar.set_postfix({
-                'loss': f"{valid_loss.item():.4f}",
-                'acc': f"{accuracy.item():.3f}"
+                'loss': f"{total_loss.item():.4f}",
+                'acc': f"{accuracy.item():.3f}",
+                'kl': f"{kl_loss.item():.4f}" if self.model.use_cvae else "0.0000"
             })
             
             # Log to tensorboard
             with get_timer("tensorboard_logging"):
                 global_step = epoch * len(self.train_loader) + batch_idx
-                self.writer.add_scalar('train/loss', valid_loss.item(), global_step)
+                self.writer.add_scalar('train/loss', total_loss.item(), global_step)
+                self.writer.add_scalar('train/action_loss', valid_action_loss.item(), global_step)
+                if self.model.use_cvae:
+                    self.writer.add_scalar('train/kl_loss', kl_loss.item(), global_step)
                 self.writer.add_scalar('train/accuracy', accuracy.item(), global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], global_step)
 
             print_timing_report()
-        avg_loss = total_loss / num_batches
+        avg_loss = total_loss_accum / num_batches
         avg_acc = total_acc / num_batches
         
         logger.info(f"Epoch {epoch+1} - Train Loss: {avg_loss:.4f}, Train Acc: {avg_acc:.3f}")
@@ -650,16 +704,25 @@ class ACTTrainer:
                         
                         # Forward pass
                         with get_timer("val_forward_pass"):
-                            logits = self.model(observations, actions, mask)
+                            logits, latent_info = self.model(observations, actions, mask)
+                            mu, logvar = latent_info
                         
                         # Compute loss
                         with get_timer("val_loss_computation"):
-                            loss = self.criterion(
+                            # Action prediction loss
+                            action_loss = self.criterion(
                                 logits.reshape(-1, logits.size(-1)),
                                 actions.reshape(-1)
                             )
-                            loss = loss.reshape(actions.shape)
-                            valid_loss = (loss * mask.float()).sum() / mask.sum()
+                            action_loss = action_loss.reshape(actions.shape)
+                            valid_action_loss = (action_loss * mask.float()).sum() / mask.sum()
+                            
+                            # Total loss (including KL if using CVAE)
+                            valid_loss = valid_action_loss
+                            if self.model.use_cvae and mu is not None and logvar is not None:
+                                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+                                kl_loss = kl_loss.mean()
+                                valid_loss = valid_action_loss + self.kl_weight * kl_loss
                         
                         # Calculate accuracy
                         with get_timer("val_accuracy_computation"):
@@ -723,9 +786,6 @@ class ACTTrainer:
             
             # Validate
             val_loss, val_acc = self.validate(epoch)
-            
-            # Update scheduler
-            self.scheduler.step()
             
             # Save checkpoint
             is_best = val_loss < best_val_loss

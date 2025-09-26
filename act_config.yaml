@@ -7,14 +7,18 @@ data:
 
 # Model architecture
 model:
-  action_dim: 9  # 0-8 directional actions (no action + 8 directions)
-  chunk_size: 32  # Number of future actions to predict per observation
+  action_dim: 9
+  chunk_size: 32
   hidden_dim: 256
   nhead: 8
-  num_encoder_layers: 4  # Encoder layers for observation processing
-  num_decoder_layers: 6  # Decoder layers for action sequence generation
+  num_encoder_layers: 4
+  num_decoder_layers: 6
   dim_feedforward: 1024
   dropout: 0.1
+  spatial_size: 8
+  # CVAE settings
+  use_cvae: true
+  latent_dim: 32
 
 # Training parameters
 training:
@@ -23,6 +27,8 @@ training:
   lr: 1e-4
   weight_decay: 1e-4
   num_workers: 4
+  # CVAE loss weight
+  kl_weight: 10.0
 
 # Logging and checkpoints
 logging:
