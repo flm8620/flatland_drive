@@ -41,21 +41,61 @@ def reparametrize(mu, logvar):
     return mu + std * eps
 
 
+def create_episode_split(h5_file_path: str, train_split: float = 0.8, random_seed: int = 42):
+    """
+    Create explicit train/val episode splits for reproducible dataset creation.
+    
+    Args:
+        h5_file_path: Path to the H5 file containing demonstrations
+        train_split: Fraction of episodes to use for training
+        random_seed: Random seed for reproducible splits
+    
+    Returns:
+        tuple: (train_episode_indices, val_episode_indices)
+    """
+    with h5py.File(h5_file_path, 'r') as h5_file:
+        total_episodes = h5_file.attrs['total_episodes']
+    
+    # Create reproducible episode indices
+    np.random.seed(random_seed)
+    all_indices = np.arange(total_episodes)
+    np.random.shuffle(all_indices)
+    
+    # Split based on train_split
+    split_idx = int(total_episodes * train_split)
+    train_indices = all_indices[:split_idx]
+    val_indices = all_indices[split_idx:]
+    
+    # Sort indices to maintain some ordering
+    train_indices = np.sort(train_indices)
+    val_indices = np.sort(val_indices)
+    
+    print(f"Episode split - Train: {len(train_indices)} episodes, Val: {len(val_indices)} episodes")
+    print(f"Train episodes: {train_indices[:10]}{'...' if len(train_indices) > 10 else ''}")
+    print(f"Val episodes: {val_indices[:10]}{'...' if len(val_indices) > 10 else ''}")
+    
+    return train_indices, val_indices
+
+
 class FlatlandDataset(Dataset):
     """Dataset for loading Flatland human demonstration data from H5 files."""
     
     def __init__(self, h5_file_path: str, chunk_size: int = 32, 
-                 train_split: float = 0.8, mode: str = 'train'):
+                 episode_indices: np.ndarray = None, mode: str = 'train'):
         """
         Args:
             h5_file_path: Path to the H5 file containing demonstrations
             chunk_size: Number of actions to predict per observation
-            train_split: Fraction of episodes to use for training
-            mode: 'train' or 'val'
+            episode_indices: Explicit array of episode indices to use for this split
+            mode: 'train' or 'val' (used for logging only)
         """
+        if episode_indices is None:
+            raise ValueError("episode_indices must be provided. Use create_episode_split() to generate them.")
+        
         self.h5_file_path = h5_file_path
         self.chunk_size = chunk_size
         self.mode = mode
+        self.episode_indices = episode_indices
         
         # Open HDF5 file and keep it open for the dataset lifetime
         self.h5_file = h5py.File(h5_file_path, 'r')
@@ -65,17 +105,15 @@ class FlatlandDataset(Dataset):
         self.view_size = self.h5_file.attrs['view_size']
         self.num_levels = self.h5_file.attrs['num_levels']
         
-        # Load episode metadata
-        episodes = self.h5_file['episodes'][:total_episodes]
+        # Validate episode indices
+        if np.max(episode_indices) >= total_episodes:
+            raise ValueError(f"Episode index {np.max(episode_indices)} >= total episodes {total_episodes}")
         
-        # Split episodes
-        split_idx = int(total_episodes * train_split)
-        if mode == 'train':
-            self.episodes = episodes[:split_idx]
-        else:  # val
-            self.episodes = episodes[split_idx:]
+        # Load episode metadata for selected episodes only
+        all_episodes = self.h5_file['episodes'][:total_episodes]
+        self.episodes = all_episodes[episode_indices]
         
-        print(f"{mode.capitalize()} split: {len(self.episodes)} episodes")
+        print(f"{mode.capitalize()} split: {len(self.episodes)} episodes (indices: {len(episode_indices)})")
         
         # Build list of valid starting positions for chunks
         self.valid_starts = []
@@ -484,19 +522,27 @@ class ACTTrainer:
         if hasattr(cfg, 'enable_timer') and cfg.enable_timer:
             set_timing_enabled(True)
         
-        # Create datasets
+        # Create explicit episode splits for reproducible train/val separation
+        with get_timer("episode_split_creation"):
+            train_episode_indices, val_episode_indices = create_episode_split(
+                h5_file_path=cfg.data.h5_file_path,
+                train_split=cfg.data.train_split,
+                random_seed=getattr(cfg.data, 'split_seed', 42)  # Allow configurable seed
+            )
+        
+        # Create datasets with explicit episode indices
         with get_timer("dataset_creation"):
             self.train_dataset = FlatlandDataset(
                 h5_file_path=cfg.data.h5_file_path,
                 chunk_size=cfg.model.chunk_size,
-                train_split=cfg.data.train_split,
+                episode_indices=train_episode_indices,
                 mode='train'
             )
             
             self.val_dataset = FlatlandDataset(
                 h5_file_path=cfg.data.h5_file_path,
                 chunk_size=cfg.model.chunk_size,
-                train_split=cfg.data.train_split,
+                episode_indices=val_episode_indices,
                 mode='val'
             )
         
@@ -732,7 +778,7 @@ class ACTTrainer:
                             
                             # Total loss (including KL if using CVAE)
                             valid_loss = valid_action_loss
-                            if self.model.use_cvae and mu is not None and logvar is not None:
+                            if self.model.use_cvae:
                                 kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
                                 kl_loss = kl_loss.mean()
                                 valid_loss = valid_action_loss + self.kl_weight * kl_loss

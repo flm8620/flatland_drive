@@ -4,6 +4,7 @@
 data:
   h5_file_path: "human_data/human_data.h5"
   train_split: 0.8
+  split_seed: 42  # Random seed for reproducible train/val episode splits
 
 # Model architecture
 model:
