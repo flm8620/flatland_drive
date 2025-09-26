@@ -177,3 +177,5 @@ viz/
 outputs/
 
 .vscode/
+
+human_data/
