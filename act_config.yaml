@@ -23,7 +23,7 @@ model:
 # Training parameters
 training:
   epochs: 200
-  batch_size: 16  # Adjust based on GPU memory
+  batch_size: 128
   lr: 1e-4
   weight_decay: 1e-4
   num_workers: 4
@@ -32,9 +32,11 @@ training:
 
 # Logging and checkpoints
 logging:
-  log_dir: "runs/act_flatland"
-  save_dir: "checkpoints/act_flatland" 
-  save_interval: 10  # Save checkpoint every N epochs
+  output_dir: "outputs_act"
+  save_interval: 5  # Save checkpoint every N epochs
+
+# Run configuration
+run_name: null  # If null, will use current timestamp
 
 # Performance monitoring
 enable_timer: false  # Enable detailed timing reports

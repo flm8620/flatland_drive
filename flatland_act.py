@@ -8,6 +8,7 @@ import os
 import h5py
 import logging
 import numpy as np
+import time
 from tqdm import tqdm
 
 import torch
@@ -20,6 +21,7 @@ from torch.autograd import Variable
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from hydra.utils import to_absolute_path
 
 # Import timer utilities
 from timer import get_timer, set_timing_enabled, reset_timer, print_timing_report
@@ -461,6 +463,23 @@ class ACTTrainer:
         self.cfg = cfg
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
+        # Set up run directories - following same pattern as PPO training
+        run_name = cfg.run_name or f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+        output_dir = to_absolute_path(cfg.logging.output_dir)
+        self.run_dir = os.path.join(output_dir, run_name)
+        
+        # Create subdirectories
+        self.log_dir = os.path.join(self.run_dir, "log")
+        self.save_dir = os.path.join(self.run_dir, "checkpoints")
+        
+        os.makedirs(self.run_dir, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+        logger.info(f"Run directory: {self.run_dir}")
+        logger.info(f"Tensorboard logs: {self.log_dir}")
+        logger.info(f"Model checkpoints: {self.save_dir}")
+        
         # Enable timing if requested
         if hasattr(cfg, 'enable_timer') and cfg.enable_timer:
             set_timing_enabled(True)
@@ -558,14 +577,8 @@ class ACTTrainer:
         # KL divergence weight for CVAE loss
         self.kl_weight = cfg.training.kl_weight
         
-        # Logging
-        self.log_dir = cfg.logging.log_dir
-        os.makedirs(self.log_dir, exist_ok=True)
+        # Initialize TensorBoard writer
         self.writer = SummaryWriter(self.log_dir)
-        
-        # Model saving
-        self.save_dir = cfg.logging.save_dir
-        os.makedirs(self.save_dir, exist_ok=True)
         
         logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()) / 1e6:.2f}M")
         logger.info(f"Device: {self.device}")
@@ -806,7 +819,8 @@ class ACTTrainer:
 
 @hydra.main(version_base=None, config_path=".", config_name="act_config")
 def main(cfg: DictConfig):
-
+    print("Config:\n", OmegaConf.to_yaml(cfg))
+    
     if not os.path.exists(cfg.data.h5_file_path):
         print(f"ERROR: Data file not found at {cfg.data.h5_file_path}")
         print("Please make sure you have recorded human demonstration data first.")
