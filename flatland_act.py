@@ -110,16 +110,21 @@ class FlatlandDataset(Dataset):
             raise ValueError(f"Episode index {np.max(episode_indices)} >= total episodes {total_episodes}")
         
         # Load episode metadata for selected episodes only
-        all_episodes = self.h5_file['episodes'][:total_episodes]
-        self.episodes = all_episodes[episode_indices]
+        episodes_array = self.h5_file['episodes']
+        assert len(episodes_array) == total_episodes, \
+            f"Episodes array length {len(episodes_array)} does not match total_episodes {total_episodes}"
+        
+        self.episodes = episodes_array[episode_indices]
         
         print(f"{mode.capitalize()} split: {len(self.episodes)} episodes (indices: {len(episode_indices)})")
         
         # Build list of valid starting positions for chunks
         self.valid_starts = []
+        print(f'dataset mode: {mode}')
         for ep in self.episodes:
             start_idx = ep['start_idx']
             length = ep['length']
+            print(f'ep start idx: {start_idx}, length: {length}')
             # Can start a chunk at any position where we have enough future actions
             for i in range(length - chunk_size + 1):
                 self.valid_starts.append(start_idx + i)
@@ -640,6 +645,53 @@ class ACTTrainer:
         # Disable timers in worker processes to avoid CUDA synchronization issues
         set_timing_enabled(False)
     
+    def compute_loss_and_accuracy(self, logits, actions, mask, latent_info):
+        """
+        Compute loss and accuracy for both training and validation.
+        
+        Args:
+            logits: (batch_size, chunk_size, action_dim) - predicted action logits
+            actions: (batch_size, chunk_size) - ground truth actions
+            mask: (batch_size, chunk_size) - padding mask
+            latent_info: [mu, logvar] from CVAE encoder
+            
+        Returns:
+            dict: Contains 'total_loss', 'action_loss', 'kl_loss', 'accuracy'
+        """
+        mu, logvar = latent_info
+        
+        # Action prediction loss
+        action_loss = self.criterion(
+            logits.reshape(-1, logits.size(-1)),  # (B * chunk_size, action_dim)
+            actions.reshape(-1)  # (B * chunk_size,)
+        )
+        action_loss = action_loss.reshape(actions.shape)  # (B, chunk_size)
+        
+        # Apply mask and average
+        valid_action_loss = (action_loss * mask.float()).sum() / mask.sum()
+        
+        # KL divergence loss (only if using CVAE)
+        total_loss = valid_action_loss
+        kl_loss = torch.tensor(0.0, device=self.device)
+        
+        if self.model.use_cvae:
+            # KL divergence: -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+            kl_loss = kl_loss.mean()  # Average over batch
+            total_loss = valid_action_loss + self.kl_weight * kl_loss
+        
+        # Calculate accuracy
+        pred_actions = torch.argmax(logits, dim=-1)
+        correct = (pred_actions == actions) * mask
+        accuracy = correct.sum().float() / mask.sum()
+        
+        return {
+            'total_loss': total_loss,
+            'action_loss': valid_action_loss,
+            'kl_loss': kl_loss,
+            'accuracy': accuracy
+        }
+    
     def train_epoch(self, epoch):
         self.model.train()
         total_loss_accum = 0
@@ -669,29 +721,14 @@ class ACTTrainer:
             # Forward pass
             with get_timer("forward_pass"):
                 logits, latent_info = self.model(observations, actions, mask)  # (B, chunk_size, action_dim)
-                mu, logvar = latent_info
             
-            # Compute losses
+            # Compute losses and accuracy
             with get_timer("loss_computation"):
-                # Action prediction loss
-                action_loss = self.criterion(
-                    logits.reshape(-1, logits.size(-1)),  # (B * chunk_size, action_dim) 
-                    actions.reshape(-1)  # (B * chunk_size,)
-                )
-                action_loss = action_loss.reshape(actions.shape)  # (B, chunk_size)
-                
-                # Apply mask and average
-                valid_action_loss = (action_loss * mask.float()).sum() / mask.sum()
-                
-                # KL divergence loss (only if using CVAE and during training)
-                total_loss = valid_action_loss
-                kl_loss = torch.tensor(0.0, device=self.device)
-                
-                if self.model.use_cvae:
-                    # KL divergence: -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
-                    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-                    kl_loss = kl_loss.mean()  # Average over batch
-                    total_loss = valid_action_loss + self.kl_weight * kl_loss
+                loss_dict = self.compute_loss_and_accuracy(logits, actions, mask, latent_info)
+                total_loss = loss_dict['total_loss']
+                valid_action_loss = loss_dict['action_loss']
+                kl_loss = loss_dict['kl_loss']
+                accuracy = loss_dict['accuracy']
             
             # Backward pass
             with get_timer("backward_pass"):
@@ -699,12 +736,6 @@ class ACTTrainer:
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 self.optimizer.step()
                 self.scheduler.step()  # Update learning rate after each step
-            
-            # Calculate accuracy
-            with get_timer("accuracy_computation"):
-                pred_actions = torch.argmax(logits, dim=-1)
-                correct = (pred_actions == actions) * mask
-                accuracy = correct.sum().float() / mask.sum()
             
             total_loss_accum += total_loss.item()
             total_acc += accuracy.item()
@@ -766,28 +797,11 @@ class ACTTrainer:
                             logits, latent_info = self.model(observations, actions, mask)
                             mu, logvar = latent_info
                         
-                        # Compute loss
+                        # Compute loss and accuracy
                         with get_timer("val_loss_computation"):
-                            # Action prediction loss
-                            action_loss = self.criterion(
-                                logits.reshape(-1, logits.size(-1)),
-                                actions.reshape(-1)
-                            )
-                            action_loss = action_loss.reshape(actions.shape)
-                            valid_action_loss = (action_loss * mask.float()).sum() / mask.sum()
-                            
-                            # Total loss (including KL if using CVAE)
-                            valid_loss = valid_action_loss
-                            if self.model.use_cvae:
-                                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-                                kl_loss = kl_loss.mean()
-                                valid_loss = valid_action_loss + self.kl_weight * kl_loss
-                        
-                        # Calculate accuracy
-                        with get_timer("val_accuracy_computation"):
-                            pred_actions = torch.argmax(logits, dim=-1)
-                            correct = (pred_actions == actions) * mask
-                            accuracy = correct.sum().float() / mask.sum()
+                            loss_dict = self.compute_loss_and_accuracy(logits, actions, mask, latent_info)
+                            valid_loss = loss_dict['total_loss']
+                            accuracy = loss_dict['accuracy']
                         
                         total_loss += valid_loss.item()
                         total_acc += accuracy.item()
@@ -801,11 +815,15 @@ class ACTTrainer:
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches
         
-        logger.info(f"Epoch {epoch+1} - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}")
+        if epoch == -1:
+            logger.info(f"Initial Validation - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}")
+        else:
+            logger.info(f"Epoch {epoch+1} - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}")
         
-        # Log to tensorboard
-        self.writer.add_scalar('val/loss', avg_loss, epoch)
-        self.writer.add_scalar('val/accuracy', avg_acc, epoch)
+        # Log to tensorboard (only for actual training epochs, not initial validation)
+        if epoch >= 0:
+            self.writer.add_scalar('val/loss', avg_loss, epoch)
+            self.writer.add_scalar('val/accuracy', avg_acc, epoch)
         
         return avg_loss, avg_acc
     
@@ -837,7 +855,16 @@ class ACTTrainer:
     def train(self):
         logger.info("Starting training...")
         
-        best_val_loss = float('inf')
+        # Run initial validation to get baseline score from random network
+        logger.info("Running initial validation to get baseline score...")
+        initial_val_loss, initial_val_acc = self.validate(epoch=-1)  # Use epoch=-1 to indicate initial validation
+        logger.info(f"Initial random network - Val Loss: {initial_val_loss:.4f}, Val Acc: {initial_val_acc:.3f}")
+        
+        # Log initial validation to tensorboard at epoch -1 for reference
+        self.writer.add_scalar('val/loss_initial', initial_val_loss, 0)
+        self.writer.add_scalar('val/accuracy_initial', initial_val_acc, 0)
+        
+        best_val_loss = initial_val_loss  # Initialize with baseline score
         
         for epoch in range(self.cfg.training.epochs):
             # Train
