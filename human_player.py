@@ -86,18 +86,26 @@ class HumanPlayer:
             "Up-Left",       # 8: (-1/√2, 1/√2)
         ]
         
-        # Key to action mapping - WASD with combinations (corrected for inverted Y axis)
+        # Key to action mapping - Arrow keys with combinations (corrected for inverted Y axis)
         self.key_to_action = {
-            # Single keys - corrected for pygame screen coordinates vs environment coordinates
-            (pygame.K_w,): 5,           # Up on screen (W moves up visually, maps to action 5)
-            (pygame.K_d,): 3,           # Right (D) 
-            (pygame.K_s,): 1,           # Down on screen (S moves down visually, maps to action 1)
-            (pygame.K_a,): 7,           # Left (A)
-            # Key combinations for diagonal movement - corrected
-            (pygame.K_w, pygame.K_d): 4,  # Up-Right on screen (W+D: up visually + right)
-            (pygame.K_s, pygame.K_d): 2,  # Down-Right on screen (S+D: down visually + right)
-            (pygame.K_s, pygame.K_a): 8,  # Down-Left on screen (S+A: down visually + left)
-            (pygame.K_w, pygame.K_a): 6,  # Up-Left on screen (W+A: up visually + left)
+            # Single arrow keys - corrected for pygame screen coordinates vs environment coordinates
+            (pygame.K_UP,): 5,           # Up arrow (maps to action 5)
+            (pygame.K_RIGHT,): 3,        # Right arrow 
+            (pygame.K_DOWN,): 1,         # Down arrow (maps to action 1)
+            (pygame.K_LEFT,): 7,         # Left arrow
+            # Key combinations for diagonal movement
+            (pygame.K_UP, pygame.K_RIGHT): 4,    # Up-Right
+            (pygame.K_DOWN, pygame.K_RIGHT): 2,  # Down-Right
+            (pygame.K_DOWN, pygame.K_LEFT): 8,   # Down-Left
+            (pygame.K_UP, pygame.K_LEFT): 6,     # Up-Left
+        }
+        
+        # WASD to Arrow key mapping for convenience
+        self.wasd_to_arrow = {
+            pygame.K_w: pygame.K_UP,
+            pygame.K_s: pygame.K_DOWN,
+            pygame.K_a: pygame.K_LEFT,
+            pygame.K_d: pygame.K_RIGHT,
         }
         
         # Recording data
@@ -127,17 +135,19 @@ class HumanPlayer:
         
         print("Human Player initialized!")
         print("Controls:")
-        print("  WASD - Movement (combine for diagonals, e.g. W+A for up-left)")
+        print("  WASD or Arrow Keys - Movement (combine for diagonals, e.g. W+A or Up+Left for up-left)")
         print("  R - Skip current episode and start new one")
         print("  ESC - Quit")
         print()
-        print("Data being recorded:")
+        print("Recording policy: SUCCESSFUL EPISODES ONLY")
+        print("Data being recorded (success only):")
         print("  - Observations (image + state)")
         print("  - Actions and rewards") 
         print("  - Full 512x512 world maps")
         print("  - Agent positions in world coordinates")
         print("  - Start and target positions")
         print("  -> Scenes can be fully recreated from this data!")
+        print("  -> Failed episodes are discarded and not saved")
     
     def obs_level_to_pygame_surface(self, obs_level):
         """Convert observation level to pygame surface"""
@@ -248,16 +258,16 @@ class HumanPlayer:
         
         # Recording status
         draw_text("=== Recording ===", self.BLACK)
-        draw_text("ALWAYS RECORDING", self.RED)
+        draw_text("RECORDING SUCCESS ONLY", self.RED)
         saved_episodes = self.get_episode_count_in_session()
-        draw_text(f"Episodes saved: {saved_episodes}")
+        draw_text(f"Success episodes: {saved_episodes}")
         
         y_offset += 8
         
         # Controls
         draw_text("=== Controls ===", self.BLACK)
         controls = [
-            "WASD: Move",
+            "WASD/Arrows: Move",
             "Combine for diagonals",
             "R: Skip Episode",
             "ESC: Quit"
@@ -276,30 +286,37 @@ class HumanPlayer:
     
     def get_pressed_action(self, keys):
         """Get action from currently pressed keys, supporting combinations"""
-        # Check for key combinations first (more specific)
-        pressed_movement_keys = []
-        movement_keys = [pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d]
+        # Convert WASD keys to arrow keys and collect all pressed movement keys
+        pressed_arrow_keys = []
         
-        for key in movement_keys:
-            if keys[key]:
-                pressed_movement_keys.append(key)
+        # Check arrow keys directly
+        arrow_keys = [pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT]
+        for arrow_key in arrow_keys:
+            if keys[arrow_key]:
+                pressed_arrow_keys.append(arrow_key)
         
-        if not pressed_movement_keys:
+        # Convert WASD to arrow keys and add them
+        for wasd_key, arrow_key in self.wasd_to_arrow.items():
+            if keys[wasd_key]:
+                pressed_arrow_keys.append(arrow_key)
+        
+        # Remove duplicates (in case both WASD and arrow are pressed simultaneously)
+        pressed_arrow_keys = list(set(pressed_arrow_keys))
+        
+        if not pressed_arrow_keys:
             return 0  # No action
         
-        # Sort keys for consistent comparison
-        pressed_tuple = tuple(sorted(pressed_movement_keys))
+        # Try to find exact combination match without assuming order
+        pressed_set = set(pressed_arrow_keys)
         
-        # Try to find exact combination match
         for key_combo, action in self.key_to_action.items():
-            if tuple(sorted(key_combo)) == pressed_tuple:
+            if set(key_combo) == pressed_set:
                 return action
         
-        # If more than 2 keys pressed or invalid combination, take first valid single key
-        if len(pressed_movement_keys) > 2:
-            for key in pressed_movement_keys:
-                if (key,) in self.key_to_action:
-                    return self.key_to_action[(key,)]
+        # If no exact match found, try to use first valid single key as fallback
+        for arrow_key in pressed_arrow_keys:
+            if (arrow_key,) in self.key_to_action:
+                return self.key_to_action[(arrow_key,)]
         
         return 0  # No valid action found
     
@@ -709,19 +726,23 @@ class HumanPlayer:
                     print(f"FAILED! Episode finished! Reward: {episode_reward:.2f}, Steps: {step_count}")
                 
                 if current_episode_data:
-                    episode_data = {
-                        'observations': [step['obs'] for step in current_episode_data],
-                        'actions': [step['action'] for step in current_episode_data],
-                        'rewards': [step['reward'] for step in current_episode_data],
-                        'agent_positions': [step['agent_pos'] for step in current_episode_data], 
-                        'world_map': episode_world_map,     # Single world map for entire episode
-                        'start_pos': episode_start_pos,     # Single start position for entire episode
-                        'target_pos': episode_target_pos,   # Single target position for entire episode
-                        'episode_reward': episode_reward,
-                        'episode_length': len(current_episode_data),
-                        'success': success
-                    }
-                    self.save_and_reset_episode(episode_data)
+                    if success:  # Only save successful episodes
+                        episode_data = {
+                            'observations': [step['obs'] for step in current_episode_data],
+                            'actions': [step['action'] for step in current_episode_data],
+                            'rewards': [step['reward'] for step in current_episode_data],
+                            'agent_positions': [step['agent_pos'] for step in current_episode_data], 
+                            'world_map': episode_world_map,     # Single world map for entire episode
+                            'start_pos': episode_start_pos,     # Single start position for entire episode
+                            'target_pos': episode_target_pos,   # Single target position for entire episode
+                            'episode_reward': episode_reward,
+                            'episode_length': len(current_episode_data),
+                            'success': success
+                        }
+                        self.save_and_reset_episode(episode_data)
+                        print("Episode data saved to HDF5 file.")
+                    else:
+                        print(f"Failed episode not recorded - discarded {len(current_episode_data)} steps")
                 
                 # Auto-restart after a brief pause
                 pygame.time.wait(1000)  # Wait 1 second
@@ -736,7 +757,7 @@ class HumanPlayer:
                 episode_start_pos = None
                 episode_target_pos = None
             
-            clock.tick(30)  # 30 FPS
+            clock.tick(60) # FPS
         
         # Close HDF5 file before quitting
         self.close_hdf5_file()

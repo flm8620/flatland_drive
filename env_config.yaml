@@ -9,7 +9,7 @@ env:
   dt: 0.1
   
   # Physics parameters
-  a_max: 2.0
+  a_max: 1.0
   v_max: 5.0
   disk_radius: 2.0
   
