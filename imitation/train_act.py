@@ -575,7 +575,11 @@ class ACTTrainer:
         # Global step counter for consistent TensorBoard logging
         self.global_step = 0
         
-        logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()) / 1e6:.2f}M")
+        # Count model parameters (detailed breakdown like ConvNet)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        logger.info(f"Model parameters: {total_params / 1e6:.2f}M total, {trainable_params / 1e6:.2f}M trainable")
         logger.info(f"Device: {self.device}")
         logger.info(f"Train samples: {len(self.train_dataset)}")
         logger.info(f"Val samples: {len(self.val_dataset)}")
@@ -629,11 +633,20 @@ class ACTTrainer:
         correct = (pred_actions == actions) * mask
         accuracy = correct.sum().float() / mask.sum()
         
+        # Calculate accuracy without no-op (action 0) for better understanding of model performance
+        non_noop_mask = (actions != 0) & mask  # Non-no-op actions that are not masked
+        if non_noop_mask.sum() > 0:
+            non_noop_correct = (pred_actions == actions) * non_noop_mask
+            non_noop_accuracy = non_noop_correct.sum().float() / non_noop_mask.sum()
+        else:
+            non_noop_accuracy = torch.tensor(0.0, device=actions.device)
+        
         return {
             'total_loss': total_loss,
             'action_loss': valid_action_loss,
             'kl_loss': kl_loss,
-            'accuracy': accuracy
+            'accuracy': accuracy,
+            'non_noop_accuracy': non_noop_accuracy
         }
     
     def log_prediction_examples(self, logits, actions, mask, phase, num_samples=3):
@@ -756,6 +769,7 @@ class ACTTrainer:
         self.model.train()
         total_loss_accum = 0
         total_acc = 0
+        total_non_noop_acc = 0
         num_batches = 0
     
         dataloader_iter = iter(self.train_loader)
@@ -789,6 +803,7 @@ class ACTTrainer:
                 valid_action_loss = loss_dict['action_loss']
                 kl_loss = loss_dict['kl_loss']
                 accuracy = loss_dict['accuracy']
+                non_noop_accuracy = loss_dict['non_noop_accuracy']
             
             # Backward pass
             with get_timer("backward_pass"):
@@ -799,6 +814,7 @@ class ACTTrainer:
             
             total_loss_accum += total_loss.item()
             total_acc += accuracy.item()
+            total_non_noop_acc += non_noop_accuracy.item()
             num_batches += 1
             
             # Update progress bar
@@ -816,6 +832,7 @@ class ACTTrainer:
                 if self.model.use_cvae:
                     self.writer.add_scalar('train/kl_loss', kl_loss.item(), self.global_step)
                 self.writer.add_scalar('train/accuracy', accuracy.item(), self.global_step)
+                self.writer.add_scalar('train/accuracy_non_noop', non_noop_accuracy.item(), self.global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
                 self.writer.add_scalar('train/grad_norm', grad_norm, self.global_step)
                 
@@ -829,8 +846,9 @@ class ACTTrainer:
             print_timing_report()
         avg_loss = total_loss_accum / num_batches
         avg_acc = total_acc / num_batches
+        avg_non_noop_acc = total_non_noop_acc / num_batches
         
-        logger.info(f"Epoch {epoch+1} - Train Loss: {avg_loss:.4f}, Train Acc: {avg_acc:.3f}")
+        logger.info(f"Epoch {epoch+1} - Train Loss: {avg_loss:.4f}, Train Acc: {avg_acc:.3f}, Non-NoOp Acc: {avg_non_noop_acc:.3f}")
         
         return avg_loss, avg_acc
     
@@ -838,6 +856,7 @@ class ACTTrainer:
         self.model.eval()
         total_loss = 0
         total_acc = 0
+        total_non_noop_acc = 0
         num_batches = 0
         
         with get_timer(f"val_epoch_{epoch}"):
@@ -869,9 +888,11 @@ class ACTTrainer:
                         loss_dict = self.compute_loss_and_accuracy(logits, actions, mask, latent_info)
                         valid_loss = loss_dict['total_loss']
                         accuracy = loss_dict['accuracy']
+                        non_noop_accuracy = loss_dict['non_noop_accuracy']
                     
                     total_loss += valid_loss.item()
                     total_acc += accuracy.item()
+                    total_non_noop_acc += non_noop_accuracy.item()
                     num_batches += 1
                     
                     # Log prediction examples on the first batch of each validation
@@ -885,16 +906,18 @@ class ACTTrainer:
         
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches
+        avg_non_noop_acc = total_non_noop_acc / num_batches
         
         if epoch == -1:
-            logger.info(f"Initial Validation - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}")
+            logger.info(f"Initial Validation - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}, Non-NoOp Acc: {avg_non_noop_acc:.3f}")
         else:
-            logger.info(f"Epoch {epoch+1} - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}")
+            logger.info(f"Epoch {epoch+1} - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}, Non-NoOp Acc: {avg_non_noop_acc:.3f}")
         
         # Log to tensorboard (only for actual training epochs, not initial validation)
         if epoch >= 0:
             self.writer.add_scalar('val/loss', avg_loss, self.global_step)
             self.writer.add_scalar('val/accuracy', avg_acc, self.global_step)
+            self.writer.add_scalar('val/accuracy_non_noop', avg_non_noop_acc, self.global_step)
         
         return avg_loss, avg_acc
     
@@ -924,7 +947,19 @@ class ACTTrainer:
             torch.save(checkpoint, periodic_path)
     
     def train(self):
-        logger.info("Starting training...")
+        logger.info("Starting ACT training...")
+        
+        # Log network architecture details
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        logger.info("=" * 60)
+        logger.info("ACT MODEL ARCHITECTURE")
+        logger.info("=" * 60)
+        logger.info(f"Total parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
+        logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / 1e6:.2f}M)")
+        logger.info(f"Non-trainable parameters: {total_params - trainable_params:,}")
+        logger.info(f"Model size estimate: ~{total_params * 4 / 1e6:.1f} MB (FP32)")
+        logger.info("=" * 60)
         
         # Run initial validation to get baseline score from random network
         logger.info("Running initial validation to get baseline score...")

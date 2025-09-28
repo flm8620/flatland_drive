@@ -152,31 +152,27 @@ def analyze_and_filter_segments(h5_file_path: str,
                 # No filtering: keep all segments
                 valid_segments = [start for start, _, _ in segments]
             else:
-                # Flexible filtering: keep all passing segments + some failing segments
-                num_required_passing = int(np.ceil(total_segments_in_episode * no_op_filter_percentage))
+                # Flexible filtering: keep all passing segments + some failing segments if needed
                 num_passing = len(passing_segments)
                 
-                if num_passing >= num_required_passing:
-                    # We have enough passing segments, sample some failing ones too
-                    num_failing_to_add = total_segments_in_episode - num_passing
-                    if num_failing_to_add > 0 and len(failing_segments) > 0:
-                        # Randomly sample failing segments
-                        num_failing_to_add = min(num_failing_to_add, len(failing_segments))
-                        np.random.seed(ep_idx)  # Deterministic sampling per episode
-                        sampled_failing = np.random.choice(failing_segments, num_failing_to_add, replace=False).tolist()
-                        valid_segments = passing_segments + sampled_failing
-                    else:
-                        valid_segments = passing_segments
-                else:
-                    # Not enough passing segments, keep all and pad with failing segments if needed
-                    num_failing_needed = num_required_passing - num_passing
-                    if num_failing_needed > 0 and len(failing_segments) > 0:
-                        num_failing_needed = min(num_failing_needed, len(failing_segments))
-                        np.random.seed(ep_idx)
-                        sampled_failing = np.random.choice(failing_segments, num_failing_needed, replace=False).tolist()
-                        valid_segments = passing_segments + sampled_failing
-                    else:
-                        valid_segments = passing_segments
+                # Start with all passing segments (they're always good quality)
+                valid_segments = passing_segments[:]
+                
+                # Calculate how many total segments we want based on the percentage
+                # The percentage represents the minimum proportion that should be passing
+                # So if we have more passing than required, we can add some failing segments
+                min_total_segments = int(np.ceil(num_passing / no_op_filter_percentage))
+                
+                # Calculate how many failing segments we can add
+                num_failing_to_add = min_total_segments - num_passing
+                num_failing_to_add = min(num_failing_to_add, len(failing_segments), 
+                                       total_segments_in_episode - num_passing)
+                
+                # Add failing segments if we can and should
+                if num_failing_to_add > 0 and len(failing_segments) > 0:
+                    np.random.seed(ep_idx)  # Deterministic sampling per episode
+                    sampled_failing = np.random.choice(failing_segments, num_failing_to_add, replace=False).tolist()
+                    valid_segments.extend(sampled_failing)
             
             if len(valid_segments) > 0:
                 episode_segment_data[ep_idx] = sorted(valid_segments)
@@ -350,10 +346,6 @@ class FlatlandDataset(Dataset):
         for ep_idx in self.episode_indices:
             segment_starts = self.episode_segment_data[ep_idx]
             self.valid_starts.extend(segment_starts)
-            if len(segment_starts) <= 10:
-                print(f'Episode {ep_idx}: added {len(segment_starts)} segments: {segment_starts}')
-            else:
-                print(f'Episode {ep_idx}: added {len(segment_starts)} segments: {segment_starts[:5]}...{segment_starts[-5:]}')
         
         print(f"Total valid segment starts: {len(self.valid_starts)}")
         
@@ -467,12 +459,9 @@ def create_flatland_dataloader(h5_file_path: str,
                               action_chunk_size: int = 1,
                               train_split: float = 0.8,
                               random_seed: int = 42,
-                              max_no_op_ratio: float = 0.8,
+                              max_no_op_ratio: float = 0.1,
                               stride: int = 1,
-                              no_op_filter_percentage: float = 1.0,
-                              batch_size: int = 32,
-                              num_workers: int = 0,
-                              **dataloader_kwargs) -> Tuple[Dataset, Dataset]:
+                              no_op_filter_percentage: float = 1.0) -> Tuple[Dataset, Dataset]:
     """
     Convenience function to create train and validation datasets with proper filtering.
     

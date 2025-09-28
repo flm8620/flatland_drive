@@ -279,16 +279,16 @@ class ConvNetTrainer:
         # Create datasets using shared dataloader
         with get_timer("dataset_creation"):
             # Get filtering parameters from config (with defaults for ConvNet)
-            max_no_op_ratio = getattr(cfg.data, 'max_no_op_ratio', 1.0)  # Allow all by default for ConvNet
-            stride = getattr(cfg.data, 'stride', 1)  # Every timestep for ConvNet  
-            no_op_filter_percentage = getattr(cfg.data, 'no_op_filter_percentage', 0.7)  # Allow some no-op samples
-            
+            max_no_op_ratio = cfg.data.max_no_op_ratio
+            stride = cfg.data.stride
+            no_op_filter_percentage = cfg.data.no_op_filter_percentage
+
             self.train_dataset, self.val_dataset = create_flatland_dataloader(
                 h5_file_path=cfg.data.h5_file_path,
                 history_frames=1,  # ConvNet currently uses 1 frame
                 action_chunk_size=1,  # ConvNet predicts single actions
                 train_split=cfg.data.train_split,
-                random_seed=getattr(cfg.data, 'split_seed', 42),
+                random_seed=cfg.data.split_seed,
                 max_no_op_ratio=max_no_op_ratio,
                 stride=stride,
                 no_op_filter_percentage=no_op_filter_percentage
@@ -411,6 +411,13 @@ class ConvNetTrainer:
             pred_actions = torch.argmax(logits, dim=-1)
             accuracy = (pred_actions == actions).float().mean()
             
+            # Calculate accuracy without no-op (action 0) for better understanding of model performance
+            non_noop_mask = actions != 0  # Actions that are not no-op
+            if non_noop_mask.sum() > 0:  # Only if there are non-no-op actions in this batch
+                non_noop_accuracy = ((pred_actions == actions) & non_noop_mask).float().sum() / non_noop_mask.sum()
+            else:
+                non_noop_accuracy = torch.tensor(0.0)  # No non-no-op actions in this batch
+            
             # Accumulate metrics
             total_loss += loss.item()
             total_acc += accuracy.item()
@@ -428,6 +435,7 @@ class ConvNetTrainer:
             if batch_idx % 100 == 0:
                 self.writer.add_scalar('train/loss', loss.item(), self.global_step)
                 self.writer.add_scalar('train/accuracy', accuracy.item(), self.global_step)
+                self.writer.add_scalar('train/accuracy_non_noop', non_noop_accuracy.item(), self.global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
                 self.writer.add_scalar('train/grad_norm', grad_norm, self.global_step)
         
@@ -443,6 +451,8 @@ class ConvNetTrainer:
         self.model.eval()
         total_loss = 0
         total_acc = 0
+        total_non_noop_acc = 0
+        non_noop_batches = 0  # Count batches that have non-noop actions
         num_batches = 0
         
         all_pred_actions = []
@@ -468,9 +478,19 @@ class ConvNetTrainer:
                 pred_actions = torch.argmax(logits, dim=-1)
                 accuracy = (pred_actions == actions).float().mean()
                 
+                # Calculate accuracy without no-op (action 0)
+                non_noop_mask = actions != 0
+                if non_noop_mask.sum() > 0:
+                    non_noop_accuracy = ((pred_actions == actions) & non_noop_mask).float().sum() / non_noop_mask.sum()
+                else:
+                    non_noop_accuracy = torch.tensor(0.0)
+                
                 # Accumulate metrics
                 total_loss += loss.item()
                 total_acc += accuracy.item()
+                if non_noop_mask.sum() > 0:  # Only count batches with non-noop actions
+                    total_non_noop_acc += non_noop_accuracy.item()
+                    non_noop_batches += 1
                 num_batches += 1
                 
                 # Store predictions for detailed analysis
@@ -484,6 +504,7 @@ class ConvNetTrainer:
         
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches
+        avg_non_noop_acc = total_non_noop_acc / max(1, non_noop_batches)  # Avoid division by zero
         
         # Detailed analysis
         all_pred_actions = np.concatenate(all_pred_actions)
@@ -530,14 +551,15 @@ class ConvNetTrainer:
                 self.writer.add_histogram('val/action_dist/predictions', pred_samples, self.global_step)
         
         if epoch == -1:
-            logger.info(f"Initial validation - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}")
+            logger.info(f"Initial validation - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}, Non-NoOp Acc: {avg_non_noop_acc:.3f}")
         else:
-            logger.info(f"Epoch {epoch+1} - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}")
+            logger.info(f"Epoch {epoch+1} - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}, Non-NoOp Acc: {avg_non_noop_acc:.3f}")
         
         # Log to tensorboard (only for actual training epochs, not initial validation)
         if epoch >= 0:
             self.writer.add_scalar('val/loss', avg_loss, self.global_step)
             self.writer.add_scalar('val/accuracy', avg_acc, self.global_step)
+            self.writer.add_scalar('val/accuracy_non_noop', avg_non_noop_acc, self.global_step)
         
         return avg_loss, avg_acc
     
@@ -569,7 +591,19 @@ class ConvNetTrainer:
     
     def train(self):
         """Main training loop"""
-        logger.info("Starting training...")
+        logger.info("Starting ConvNet training...")
+        
+        # Log network architecture details
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        logger.info("=" * 60)
+        logger.info("CONVNET MODEL ARCHITECTURE")
+        logger.info("=" * 60)
+        logger.info(f"Total parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
+        logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params / 1e6:.2f}M)")
+        logger.info(f"Non-trainable parameters: {total_params - trainable_params:,}")
+        logger.info(f"Model size estimate: ~{total_params * 4 / 1e6:.1f} MB (FP32)")
+        logger.info("=" * 60)
         
         # Run initial validation
         logger.info("Running initial validation...")
