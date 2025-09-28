@@ -1,277 +1,263 @@
 #!/usr/bin/env python3
 """
-Evaluation script for ConvNet-based imitation learning model
+ConvNet Evaluation and Inference for Flatland Driving
+Test the trained ConvNet model in the environment
 """
 
 import os
 import torch
 import numpy as np
-import h5py
-from omegaconf import OmegaConf
-from pathlib import Path
-import argparse
-import time
-from collections import defaultdict
+import hydra
+from omegaconf import DictConfig
 import cv2
+from tqdm import tqdm
 
-from train_convnet import FlatlandConvNet, FlatlandConvNetDataset
-from env.env import ParallelDrivingEnv
-
-
-def load_model(checkpoint_path: str, device: str = 'cuda'):
-    """Load trained ConvNet model from checkpoint"""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    config = checkpoint['config']
-    
-    # Create model
-    model = FlatlandConvNet(
-        num_levels=3,  # Default from dataset
-        view_size=64,  # Default from dataset  
-        action_dim=config['model']['action_dim'],
-        hidden_dim=config['model']['hidden_dim'],
-        dropout=config['model']['dropout']
-    ).to(device)
-    
-    # Load weights
-    model.load_state_dict(checkpoint['state_dict'])
-    model.eval()
-    
-    print(f"Loaded model from epoch {checkpoint['epoch']} with val loss {checkpoint['loss']:.4f}")
-    
-    return model, config
+from imitation.train_convnet import FlatlandConvNet
+from env.env import ParallelDrivingEnv, get_human_frame
 
 
-def evaluate_on_dataset(model, dataset, device, num_samples=1000):
-    """
-    Evaluate model on validation dataset
+class ConvNetAgent:
+    """Agent that uses trained ConvNet model for action prediction"""
     
-    Args:
-        model: Trained ConvNet model
-        dataset: FlatlandConvNetDataset instance
-        device: Device to run on
-        num_samples: Number of samples to evaluate on
+    def __init__(self, checkpoint_path: str, num_levels: int, view_size: int, device='cuda'):
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-    Returns:
-        dict: Evaluation metrics
-    """
-    model.eval()
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        model_config = checkpoint['config']['model']
+        
+        # Create model with same config as training
+        self.model = FlatlandConvNet(
+            num_levels=num_levels,  # From environment config
+            view_size=view_size,  # From environment config
+            action_dim=model_config['action_dim'],
+            hidden_dim=model_config['hidden_dim'],
+            dropout=model_config['dropout']
+        ).to(self.device)
+        
+        # Load weights
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.eval()
+        
+        print(f"Loaded ConvNet model from {checkpoint_path}")
+        print(f"Model epoch: {checkpoint['epoch']}, Loss: {checkpoint['loss']:.4f}")
+        
+        # Model statistics
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Model parameters: {total_params / 1e6:.2f}M")
     
-    # Limit samples if dataset is smaller
-    num_samples = min(num_samples, len(dataset))
-    
-    correct_predictions = 0
-    total_predictions = 0
-    action_counts = defaultdict(int)
-    action_correct = defaultdict(int)
-    
-    print(f"Evaluating on {num_samples} samples...")
-    
-    with torch.no_grad():
-        for i in range(num_samples):
-            if i % 100 == 0:
-                print(f"Progress: {i}/{num_samples}")
-                
-            observations, true_action = dataset[i]
-            
-            # Add batch dimension and move to device
+    def predict_action(self, observation):
+        """
+        Predict action given observation
+        
+        Args:
+            observation: Dict with 'image' and 'state' keys
+                - image: (num_levels, 2, view_size, view_size) 
+                - state: (2,)
+        
+        Returns:
+            action: Predicted action (int)
+        """
+        with torch.no_grad():
+            # Add batch dimension, convert to float, and move to device
             obs_batch = {
-                'image': observations['image'].unsqueeze(0).to(device),
-                'state': observations['state'].unsqueeze(0).to(device)
+                'image': observation['image'].float().unsqueeze(0).to(self.device),
+                'state': observation['state'].float().unsqueeze(0).to(self.device)
             }
             
-            # Predict
-            logits = model(obs_batch)
-            pred_action = torch.argmax(logits, dim=-1).item()
-            true_action = true_action.item()
+            # Forward pass - use generate() like ACT for sampling-based inference
+            actions = self.model.generate(obs_batch)  # (1,)
             
-            # Update metrics
-            total_predictions += 1
-            action_counts[true_action] += 1
+            # Get predicted action
+            action = actions[0].item()
             
-            if pred_action == true_action:
-                correct_predictions += 1
-                action_correct[true_action] += 1
+            return action
     
-    # Compute metrics
-    overall_accuracy = correct_predictions / total_predictions
-    
-    action_names = ["No-op", "Up", "Up-Right", "Right", "Down-Right", 
-                   "Down", "Down-Left", "Left", "Up-Left"]
-    
-    print(f"\n=== EVALUATION RESULTS ===")
-    print(f"Overall Accuracy: {overall_accuracy:.3f} ({correct_predictions}/{total_predictions})")
-    print(f"\nPer-Action Results:")
-    print(f"{'Action':<12} {'Count':<8} {'Accuracy':<10} {'Frequency':<10}")
-    print("-" * 45)
-    
-    for action in range(9):
-        count = action_counts[action]
-        if count > 0:
-            acc = action_correct[action] / count
-            freq = count / total_predictions
-            print(f"{action_names[action]:<12} {count:<8} {acc:<10.3f} {freq:<10.3f}")
-        else:
-            print(f"{action_names[action]:<12} {0:<8} {'N/A':<10} {0.0:<10.3f}")
-    
-    return {
-        'overall_accuracy': overall_accuracy,
-        'total_samples': total_predictions,
-        'action_counts': dict(action_counts),
-        'action_accuracies': {k: action_correct[k] / action_counts[k] if action_counts[k] > 0 else 0 
-                             for k in range(9)}
-    }
+    def reset(self):
+        """Reset agent state (ConvNet doesn't need this, but for consistency with ACT)"""
+        pass
 
 
-def evaluate_in_environment(model, env_config_path, device, num_episodes=10, max_steps=500):
-    """
-    Evaluate model by running episodes in the environment
+def evaluate_agent(cfg: DictConfig, agent: ConvNetAgent, num_episodes: int = 10, render: bool = True, run_name: str = None):
+    """Evaluate the ConvNet agent in the environment"""
     
-    Args:
-        model: Trained ConvNet model
-        env_config_path: Path to environment config
-        device: Device to run on
-        num_episodes: Number of episodes to run
-        max_steps: Maximum steps per episode
-        
-    Returns:
-        dict: Environment evaluation metrics
-    """
-    model.eval()
+    # Create evaluation output directory
+    if run_name is None:
+        run_name = "evaluation"
     
-    # Load environment config
-    env_config = OmegaConf.load(env_config_path)
+    eval_dir = os.path.join("eval_outputs", run_name)
+    os.makedirs(eval_dir, exist_ok=True)
     
-    # Create environment
+    if render:
+        video_dir = os.path.join(eval_dir, "videos")
+        os.makedirs(video_dir, exist_ok=True)
+    
+    # Create environment using config parameters
     env = ParallelDrivingEnv(
-        batch_size=1,  # Single environment
-        view_size=env_config.view_size,
-        num_levels=env_config.num_levels,
-        max_episode_steps=max_steps,
-        device=device
+        num_envs=cfg.env.num_envs,
+        view_size=cfg.env.view_size,
+        dt=cfg.env.dt,
+        a_max=cfg.env.a_max,
+        v_max=cfg.env.v_max,
+        w_col=cfg.env.w_col,
+        R_goal=cfg.env.R_goal,
+        disk_radius=cfg.env.disk_radius,
+        render_dir=cfg.env.render_dir,
+        video_fps=cfg.env.video_fps,
+        w_dist=cfg.env.w_dist,
+        w_accel=cfg.env.w_accel,
+        max_steps=cfg.env.max_steps,
+        hitwall_cost=cfg.env.hitwall_cost,
+        pyramid_levels=cfg.env.pyramid_levels,
+        num_levels=cfg.env.num_levels,
+        min_start_goal_dist=cfg.env.min_start_goal_dist,
+        max_start_goal_dist=cfg.env.max_start_goal_dist,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
+    
+    results = {
+        'success_rate': 0,
+        'avg_episode_reward': 0,
+        'avg_episode_length': 0,
+        'collision_rate': 0
+    }
     
     episode_rewards = []
     episode_lengths = []
-    success_count = 0
+    successes = 0
+    collisions = 0
     
-    print(f"\n=== ENVIRONMENT EVALUATION ===")
-    print(f"Running {num_episodes} episodes...")
-    
-    for episode in range(num_episodes):
-        obs = env.reset()
+    for episode in tqdm(range(num_episodes), desc="Evaluating"):
+        obs, info = env.reset()
+        agent.reset()
+        
         episode_reward = 0
         episode_length = 0
         done = False
+        frames = []
         
-        with torch.no_grad():
-            while not done and episode_length < max_steps:
-                # Model prediction
-                logits = model(obs)
-                action = torch.argmax(logits, dim=-1)  # (1,) - single action
-                
-                # Environment step
-                obs, reward, done, info = env.step(action)
-                
-                episode_reward += reward.item()
-                episode_length += 1
-                
-                # Check if episode completed successfully
-                if done and reward.item() > 0:  # Positive reward indicates success
-                    success_count += 1
+        while not done:
+            # Get action from agent
+            obs_single = obs[0]  # Single environment observation
+            obs_dict = {
+                'image': obs_single['image'],
+                'state': obs_single['state']
+            }
+            
+            action = agent.predict_action(obs_dict)
+            
+            # Step environment - ensure action tensor is on correct device
+            action_tensor = torch.tensor([action], device=env.device)
+            obs, reward, terminated, truncated, info = env.step(action_tensor)
+            
+            episode_reward += reward[0].item()
+            episode_length += 1
+            done = terminated[0] or truncated[0]
+            
+            # Render frame if requested
+            if render:
+                frame = get_human_frame(
+                    obs_single,
+                    info['vel'][0].cpu(),
+                    cfg.env.v_max,
+                    action=action,
+                    info={k: v[0] for k, v in info.items() if k != 'vel'},
+                    a_max=cfg.env.a_max
+                )
+                frames.append(frame)
         
+        # Record episode results
         episode_rewards.append(episode_reward)
-        episode_lengths.append(episode_length) 
+        episode_lengths.append(episode_length)
         
-        print(f"Episode {episode+1}: Reward={episode_reward:.2f}, Length={episode_length}, "
-              f"Success={'Yes' if done and episode_reward > 0 else 'No'}")
+        if info['success'][0]:
+            successes += 1
+        if info['hitwall'][0] < -1:  # Collision detected
+            collisions += 1
+        
+        # Save video if rendering
+        if render and frames:
+            video_path = os.path.join(video_dir, f'episode_{episode:03d}.avi')
+            height, width = frames[0].shape[:2]
+            
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            out = cv2.VideoWriter(video_path, fourcc, 10.0, (width, height))
+            
+            for frame in frames:
+                out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            
+            out.release()
+        
+        print(f"Episode {episode+1}: Reward={episode_reward:.1f}, Length={episode_length}, "
+              f"Success={'Yes' if info['success'][0] else 'No'}")
     
-    # Compute metrics
-    mean_reward = np.mean(episode_rewards)
-    std_reward = np.std(episode_rewards)
-    mean_length = np.mean(episode_lengths)
-    success_rate = success_count / num_episodes
+    # Calculate final statistics
+    results['success_rate'] = successes / num_episodes
+    results['avg_episode_reward'] = np.mean(episode_rewards)
+    results['avg_episode_length'] = np.mean(episode_lengths)
+    results['collision_rate'] = collisions / num_episodes
     
-    print(f"\n=== ENVIRONMENT RESULTS ===")
-    print(f"Mean Reward: {mean_reward:.3f} ± {std_reward:.3f}")
-    print(f"Mean Episode Length: {mean_length:.1f}")
-    print(f"Success Rate: {success_rate:.3f} ({success_count}/{num_episodes})")
+    print("\n" + "="*50)
+    print("EVALUATION RESULTS")
+    print("="*50)
+    print(f"Episodes: {num_episodes}")
+    print(f"Success Rate: {results['success_rate']:.1%}")
+    print(f"Average Episode Reward: {results['avg_episode_reward']:.2f}")
+    print(f"Average Episode Length: {results['avg_episode_length']:.1f}")
+    print(f"Collision Rate: {results['collision_rate']:.1%}")
+    print("="*50)
     
-    return {
-        'mean_reward': mean_reward,
-        'std_reward': std_reward,
-        'mean_length': mean_length,
-        'success_rate': success_rate,
-        'episode_rewards': episode_rewards,
-        'episode_lengths': episode_lengths
-    }
+    return results, eval_dir
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Evaluate ConvNet imitation learning model')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                       help='Path to model checkpoint')
-    parser.add_argument('--data_path', type=str, 
-                       default='human_data/human_data_250928-3.h5',
-                       help='Path to evaluation dataset')
-    parser.add_argument('--env_config', type=str,
-                       default='config/env_config.yaml',
-                       help='Path to environment config')
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='Device to run evaluation on')
-    parser.add_argument('--eval_samples', type=int, default=1000,
-                       help='Number of dataset samples to evaluate on')
-    parser.add_argument('--eval_episodes', type=int, default=10,
-                       help='Number of environment episodes to run')
-    parser.add_argument('--no_dataset_eval', action='store_true',
-                       help='Skip dataset evaluation')
-    parser.add_argument('--no_env_eval', action='store_true', 
-                       help='Skip environment evaluation')
+@hydra.main(version_base=None, config_path="../config", config_name="eval_config")
+def main(cfg: DictConfig):
+    """Main evaluation function"""
     
-    args = parser.parse_args()
+    import json
     
-    # Check if checkpoint exists
-    if not os.path.exists(args.checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    # Check for checkpoint_path and run_name in config
+    checkpoint_path = cfg.checkpoint_path
+    eval_run_name = cfg.run_name
+
+    if not checkpoint_path:
+        print("ERROR: checkpoint_path must be provided!")
+        print("Usage: python -m imitation.eval_convnet checkpoint_path=/path/to/checkpoint.pth")
+        print("Optional: python -m imitation.eval_convnet checkpoint_path=/path/to/checkpoint.pth run_name=my_eval")
+        return
     
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Loading checkpoint: {checkpoint_path}")
     
-    # Load model
-    model, config = load_model(args.checkpoint, device)
+    # Determine run name for output organization
+    if eval_run_name:
+        run_name = eval_run_name
+        print(f"Using provided run name: {run_name}")
+    else:
+        # Extract run name from checkpoint path for organized output
+        # e.g., "checkpoints/convnet_flatland/run_20250926_151024/best_model.pth" -> "run_20250926_151024"
+        path_parts = checkpoint_path.split(os.sep)
+        run_name = None
+        for part in path_parts:
+            if part.startswith('run_') or part.startswith('0'):  # Handle both run_* and date formats like 0928
+                run_name = part
+                break
+        
+        if run_name is None:
+            # Fallback to checkpoint filename without extension
+            run_name = os.path.basename(checkpoint_path).replace('.pth', '')
+        
+        print(f"Auto-detected run name: {run_name}")
     
-    # Dataset evaluation
-    if not args.no_dataset_eval:
-        if os.path.exists(args.data_path):
-            # Create validation dataset (using same split logic as training)
-            with h5py.File(args.data_path, 'r') as h5_file:
-                total_episodes = h5_file.attrs['total_episodes']
-                
-            # Use same split logic as training
-            np.random.seed(42)  # Same seed as training
-            episode_indices = np.arange(total_episodes)
-            np.random.shuffle(episode_indices)
-            
-            split_idx = int(total_episodes * 0.8)  # Same split as training
-            val_episode_indices = sorted(episode_indices[split_idx:].tolist())
-            
-            val_dataset = FlatlandConvNetDataset(
-                args.data_path,
-                episode_indices=val_episode_indices,
-                mode='val'
-            )
-            
-            dataset_metrics = evaluate_on_dataset(model, val_dataset, device, args.eval_samples)
-        else:
-            print(f"Dataset not found: {args.data_path}. Skipping dataset evaluation.")
+    agent = ConvNetAgent(checkpoint_path, cfg.env.num_levels, cfg.env.view_size)
+    results, eval_dir = evaluate_agent(cfg, agent, num_episodes=1, render=True, run_name=run_name)
     
-    # Environment evaluation  
-    if not args.no_env_eval:
-        if os.path.exists(args.env_config):
-            env_metrics = evaluate_in_environment(model, args.env_config, device, args.eval_episodes)
-        else:
-            print(f"Environment config not found: {args.env_config}. Skipping environment evaluation.")
+    # Save results in the evaluation directory
+    results_path = os.path.join(eval_dir, 'results.json')
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
     
-    print("\n=== EVALUATION COMPLETE ===")
+    print(f"Results saved to {results_path}")
+    print(f"Videos saved in {os.path.join(eval_dir, 'videos')}")
 
 
 if __name__ == '__main__':

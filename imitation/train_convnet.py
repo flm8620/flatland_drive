@@ -375,9 +375,9 @@ class ConvNetTrainer:
             
             # Log to tensorboard
             if batch_idx % 100 == 0:
-                self.writer.add_scalar('train/loss_step', loss.item(), self.global_step)
-                self.writer.add_scalar('train/accuracy_step', accuracy.item(), self.global_step)
-                self.writer.add_scalar('train/learning_rate', self.optimizer.param_groups[0]['lr'], self.global_step)
+                self.writer.add_scalar('train/loss', loss.item(), self.global_step)
+                self.writer.add_scalar('train/accuracy', accuracy.item(), self.global_step)
+                self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
         
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches
@@ -482,6 +482,11 @@ class ConvNetTrainer:
         else:
             logger.info(f"Epoch {epoch+1} - Val Loss: {avg_loss:.4f}, Val Acc: {avg_acc:.3f}")
         
+        # Log to tensorboard (only for actual training epochs, not initial validation)
+        if epoch >= 0:
+            self.writer.add_scalar('val/loss', avg_loss, self.global_step)
+            self.writer.add_scalar('val/accuracy', avg_acc, self.global_step)
+        
         return avg_loss, avg_acc
     
     def save_checkpoint(self, epoch, loss, is_best=False):
@@ -518,6 +523,10 @@ class ConvNetTrainer:
         logger.info("Running initial validation...")
         initial_val_loss, initial_val_acc = self.validate(epoch=-1)
         
+        # Log initial validation to tensorboard for reference
+        self.writer.add_scalar('val/loss_initial', initial_val_loss, 0)
+        self.writer.add_scalar('val/accuracy_initial', initial_val_acc, 0)
+        
         best_val_loss = initial_val_loss
         
         for epoch in range(self.cfg.training.epochs):
@@ -531,10 +540,10 @@ class ConvNetTrainer:
             self.scheduler.step()
             
             # Log to tensorboard
-            self.writer.add_scalar('train/loss_epoch', train_loss, epoch)
-            self.writer.add_scalar('train/accuracy_epoch', train_acc, epoch)
-            self.writer.add_scalar('val/loss_epoch', val_loss, epoch)
-            self.writer.add_scalar('val/accuracy_epoch', val_acc, epoch)
+            self.writer.add_scalar('epoch/train_loss', train_loss, epoch)
+            self.writer.add_scalar('epoch/train_acc', train_acc, epoch)
+            self.writer.add_scalar('epoch/val_loss', val_loss, epoch)
+            self.writer.add_scalar('epoch/val_acc', val_acc, epoch)
             
             # Save checkpoint
             is_best = val_loss < best_val_loss
