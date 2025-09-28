@@ -2,9 +2,13 @@
 
 # Data settings
 data:
-  h5_file_path: "human_data/human_data_250928.h5"
+  h5_file_path: "human_data/human_data_250928-3.h5"
   train_split: 0.8
   split_seed: 42  # Random seed for reproducible train/val episode splits
+  # Segment-level action distribution filtering to reduce no-op bias
+  max_no_op_ratio: 0.8    # Maximum allowed ratio of no-op actions in a segment (0.0-1.0)
+  min_meaningful_actions: 3  # Minimum number of meaningful (non-no-op) actions required per segment
+  stride: 16  # Stride between segment starts
 
 # Model architecture
 model:
