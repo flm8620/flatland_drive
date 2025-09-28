@@ -100,17 +100,7 @@ class HumanPlayer:
             (pygame.K_w, pygame.K_a): 6,  # Up-Left on screen (W+A: up visually + left)
         }
         
-        # Game state
-        self.current_action = 0
-        self.obs = None
-        self.info = None
-        self.done = False
-        self.episode_reward = 0.0
-        self.step_count = 0
-        
         # Recording data
-        self.recording = True
-        self.current_episode_data = []
         self.episode_count = 0
         self.session_start_time = time.strftime("%Y%m%d_%H%M%S")
         
@@ -138,9 +128,16 @@ class HumanPlayer:
         print("Human Player initialized!")
         print("Controls:")
         print("  WASD - Movement (combine for diagonals, e.g. W+A for up-left)")
-        print("  R - Start/Stop Recording")
-        print("  SPACE - Reset Environment")
+        print("  R - Skip current episode and start new one")
         print("  ESC - Quit")
+        print()
+        print("Data being recorded:")
+        print("  - Observations (image + state)")
+        print("  - Actions and rewards") 
+        print("  - Full 512x512 world maps")
+        print("  - Agent positions in world coordinates")
+        print("  - Start and target positions")
+        print("  -> Scenes can be fully recreated from this data!")
     
     def obs_level_to_pygame_surface(self, obs_level):
         """Convert observation level to pygame surface"""
@@ -211,7 +208,7 @@ class HumanPlayer:
             # Arrow tip
             pygame.draw.circle(surface, self.YELLOW, tip, 3)
     
-    def draw_info_panel(self):
+    def draw_info_panel(self, info, done=False, current_action=0, episode_reward=0.0, step_count=0):
         """Draw the information panel"""
         panel_x = self.level_display_size * self.num_levels
         panel_rect = pygame.Rect(panel_x, 0, self.info_panel_width, self.window_height)
@@ -228,32 +225,30 @@ class HumanPlayer:
         
         # Game info
         draw_text("=== Game Info ===", self.BLACK)
-        draw_text(f"Step: {self.step_count}")
-        draw_text(f"Reward: {self.episode_reward:.2f}")
+        draw_text(f"Step: {step_count}")
+        draw_text(f"Reward: {episode_reward:.2f}")
         draw_text(f"Episodes: {self.episode_count}")
         
-        if self.info is not None:
-            draw_text(f"Progress: {self.info['r_progress'][0].item():.3f}")
-            draw_text(f"Goal: {self.info['r_goal'][0].item():.3f}")
-            draw_text(f"Hitwall: {self.info['hitwall'][0].item():.3f}")
+        if info is not None:
+            draw_text(f"Progress: {info['r_progress'][0].item():.3f}")
+            draw_text(f"Goal: {info['r_goal'][0].item():.3f}")
+            draw_text(f"Hitwall: {info['hitwall'][0].item():.3f}")
             
-            vel = self.info['vel'][0]
+            vel = info['vel'][0]
             draw_text(f"Vel: ({vel[0].item():.2f}, {vel[1].item():.2f})")
         
         y_offset += 8
         
         # Current action
         draw_text("=== Current Action ===", self.BLACK)
-        action_name = self.action_names[self.current_action]
-        draw_text(f"{self.current_action}: {action_name}", self.BLUE)
+        action_name = self.action_names[current_action]
+        draw_text(f"{current_action}: {action_name}", self.BLUE)
         
         y_offset += 8
         
         # Recording status
-        status_color = self.RED if self.recording else self.BLACK
         draw_text("=== Recording ===", self.BLACK)
-        status_text = "RECORDING" if self.recording else "NOT RECORDING"
-        draw_text(status_text, status_color)
+        draw_text("ALWAYS RECORDING", self.RED)
         saved_episodes = self.get_episode_count_in_session()
         draw_text(f"Episodes saved: {saved_episodes}")
         
@@ -264,8 +259,7 @@ class HumanPlayer:
         controls = [
             "WASD: Move",
             "Combine for diagonals",
-            "R: Toggle Recording",
-            "SPACE: Reset",
+            "R: Skip Episode",
             "ESC: Quit"
         ]
         for control in controls:
@@ -274,7 +268,7 @@ class HumanPlayer:
             y_offset += 16
         
         # Status
-        if self.done:
+        if done:
             y_offset += 15
             status_text = "EPISODE FINISHED!"
             surface = self.font.render(status_text, True, self.RED)
@@ -310,13 +304,14 @@ class HumanPlayer:
         return 0  # No valid action found
     
     def reset_environment(self):
-        """Reset the environment for a new episode"""
-        self.obs, self.info = self.env.reset()
-        self.done = False
-        self.episode_reward = 0.0
-        self.step_count = 0
-        self.current_action = 0
+        """Reset the environment for a new episode and return initial observation"""
+        obs, info = self.env.reset()
+        
+        # Don't record anything here - let the main loop handle all recording
+        # The first observation will be recorded when the human takes the first action
+        
         print(f"Environment reset. Starting episode {self.episode_count + 1}")
+        return obs, info
     
     def _init_or_append_hdf5_dataset(self):
         """Initialize HDF5 dataset for efficient storage or append to existing file"""
@@ -334,7 +329,8 @@ class HumanPlayer:
         self.hdf5_file = h5py.File(self.hdf5_filename, 'a')  # Open in append mode
         
         # Verify file structure is compatible (new format with separate image/state)
-        required_datasets = ['obs_images', 'obs_states', 'actions', 'rewards', 'episodes']
+        required_datasets = ['obs_images', 'obs_states', 'actions', 'rewards', 'episodes', 
+                           'agent_positions']
         for dataset_name in required_datasets:
             if dataset_name not in self.hdf5_file:
                 raise ValueError(f"Existing HDF5 file missing required dataset: {dataset_name}")
@@ -357,6 +353,9 @@ class HumanPlayer:
         self.actions_dataset = self.hdf5_file['actions']
         self.rewards_dataset = self.hdf5_file['rewards']
         self.episodes_dataset = self.hdf5_file['episodes']
+        
+        # Get world state datasets (only agent positions per step)
+        self.agent_positions_dataset = self.hdf5_file['agent_positions']
         
         # Get current counts from existing data
         self.total_steps_recorded = self.hdf5_file.attrs.get('total_steps', len(self.obs_images_dataset))
@@ -415,6 +414,15 @@ class HumanPlayer:
             chunks=(chunk_size,)  # No compression
         )
         
+        # Agent positions: [total_steps, 2] - Agent x,y coordinates in world space
+        self.agent_positions_dataset = self.hdf5_file.create_dataset(
+            'agent_positions',
+            shape=(initial_steps, 2),
+            maxshape=(None, 2),
+            dtype=np.float32,
+            chunks=(chunk_size, 2)  # No compression for positions
+        )
+        
         # Episode metadata: [num_episodes]
         self.episodes_dataset = self.hdf5_file.create_dataset(
             'episodes',
@@ -425,7 +433,10 @@ class HumanPlayer:
                 ('length', 'i4'),         # Episode length
                 ('reward', 'f4'),         # Total episode reward
                 ('success', 'b1'),        # Success flag
-                ('timestamp', 'S20')      # Timestamp string
+                ('timestamp', 'S20'),     # Timestamp string
+                ('world_map', 'f4', (512, 512)),  # World cost map for this episode
+                ('start_pos', 'i4', (2,)),        # Start position [x, y]
+                ('target_pos', 'i4', (2,))        # Target position [x, y]
             ],
             chunks=(100,)
         )
@@ -458,6 +469,9 @@ class HumanPlayer:
             self.obs_states_dataset.resize((new_size, *self.obs_states_dataset.shape[1:]))
             self.actions_dataset.resize((new_size,))
             self.rewards_dataset.resize((new_size,))
+            
+            # Resize agent positions dataset
+            self.agent_positions_dataset.resize((new_size, 2))
         
         # Check and resize episode dataset
         current_episodes = self.episodes_dataset.shape[0]
@@ -465,21 +479,25 @@ class HumanPlayer:
             new_size = max(required_episodes, int(current_episodes * 1.5))
             self.episodes_dataset.resize((new_size,))
 
-    def save_episode_data(self, episode_data):
-        """Save a single episode data immediately to HDF5 file"""
-        if not episode_data or self.hdf5_file is None:
-            return
+    def save_and_reset_episode(self, episode_data):
+        """Save episode data to HDF5 file and reset episode tracking"""
         
         observations = episode_data['observations']  # List of TensorDict observations
         actions = episode_data['actions']
         rewards = episode_data['rewards']
+        agent_positions = episode_data['agent_positions']
         episode_length = len(observations)
+        
+        # Episode-level data (constant for entire episode)
+        world_map = episode_data['world_map']  # Single 512x512 map for entire episode
+        start_pos = episode_data['start_pos']  # Single start position for entire episode
+        target_pos = episode_data['target_pos']  # Single target position for entire episode
         
         # Skip episodes that are too short (likely corrupted or accidental)
         min_episode_length = 30
         if episode_length < min_episode_length:
             print(f"Skipping short episode with only {episode_length} steps (minimum: {min_episode_length})")
-            return
+            return False  # Return False to indicate episode was not saved
         
         # Extract image and state components separately
         obs_images = []
@@ -496,6 +514,14 @@ class HumanPlayer:
         actions_array = np.array(actions, dtype=np.int32)
         rewards_array = np.array(rewards, dtype=np.float32)
         
+        # Convert agent positions to numpy array (per-step data)
+        agent_positions_array = torch.stack(agent_positions).cpu().numpy().astype(np.float32)  # [episode_length, 2]
+        
+        # Convert episode-level world state data to numpy arrays
+        world_map_array = world_map.cpu().numpy().astype(np.float32)  # [512, 512]
+        start_pos_array = start_pos.cpu().numpy().astype(np.int32)  # [2]
+        target_pos_array = target_pos.cpu().numpy().astype(np.int32)  # [2]
+        
         # Resize datasets if needed
         required_steps = self.total_steps_recorded + episode_length
         required_episodes = self.episode_count + 1
@@ -510,14 +536,20 @@ class HumanPlayer:
         self.actions_dataset[start_idx:end_idx] = actions_array
         self.rewards_dataset[start_idx:end_idx] = rewards_array
         
-        # Write episode metadata
+        # Write agent positions (per-step data)
+        self.agent_positions_dataset[start_idx:end_idx] = agent_positions_array
+        
+        # Write episode metadata (including world-level data)
         episode_record = np.array([
             (
                 start_idx,
                 episode_length,
                 episode_data['episode_reward'],
                 episode_data.get('success', False),
-                time.strftime("%Y%m%d_%H%M%S").encode('utf-8')
+                time.strftime("%Y%m%d_%H%M%S").encode('utf-8'),
+                world_map_array,  # Store world map in episode metadata
+                start_pos_array,  # Store start position in episode metadata
+                target_pos_array  # Store target position in episode metadata
             )
         ], dtype=self.episodes_dataset.dtype)
         
@@ -530,7 +562,12 @@ class HumanPlayer:
         if self.episode_count % 10 == 0:
             self.hdf5_file.flush()
         
-        print(f"Saved episode {self.episode_count} with {episode_length} steps (total steps: {self.total_steps_recorded})")
+        print(f"Saved episode {self.episode_count} with {episode_length} steps (total steps: {self.total_steps_recorded}) + world state data")
+        
+        # Increment episode count after successful save
+        self.episode_count += 1
+        
+        return True  # Return True to indicate episode was saved successfully
     
     def get_episode_count_in_session(self):
         """Get the count of episodes saved in this session"""
@@ -550,6 +587,9 @@ class HumanPlayer:
                 self.obs_states_dataset.resize((self.total_steps_recorded, *self.obs_states_dataset.shape[1:]))
                 self.actions_dataset.resize((self.total_steps_recorded,))
                 self.rewards_dataset.resize((self.total_steps_recorded,))
+                
+                # Trim agent positions dataset
+                self.agent_positions_dataset.resize((self.total_steps_recorded, 2))
             
             if self.episode_count > 0:
                 self.episodes_dataset.resize((self.episode_count,))
@@ -563,128 +603,139 @@ class HumanPlayer:
         clock = pygame.time.Clock()
         running = True
         
-        # Initialize environment
-        self.reset_environment()
+        # Initialize environment - get initial observation and info
+        obs, info = self.reset_environment()
+        
+        # Local variables for episode state
+        done = False  # Local variable for episode completion
+        current_episode_data = []  # Local variable for current episode data
+        current_action = 0  # Local variable for current action
+        episode_reward = 0.0  # Local variable for episode reward
+        step_count = 0  # Local variable for step count
+        
+        # Episode-level world state (will be set on first step)
+        episode_world_map = None
+        episode_start_pos = None
+        episode_target_pos = None
         
         while running:
-            # Handle events
+            # Handle events first
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    elif event.key == pygame.K_SPACE:
-                        # Finish current episode if recording
-                        if self.recording and self.current_episode_data:
-                            episode_data = {
-                                'observations': [step['obs'] for step in self.current_episode_data],
-                                'actions': [step['action'] for step in self.current_episode_data],
-                                'rewards': [step['reward'] for step in self.current_episode_data],
-                                'episode_reward': sum(step['reward'] for step in self.current_episode_data),
-                                'episode_length': len(self.current_episode_data)
-                            }
-                            # Only increment count if episode was actually saved (not skipped for being too short)
-                            episode_length_before = len(self.current_episode_data)
-                            self.save_episode_data(episode_data)
-                            if episode_length_before >= 30:  # Episode was saved
-                                self.episode_count += 1
-                            self.current_episode_data = []
-                        
-                        self.reset_environment()
                     elif event.key == pygame.K_r:
-                        self.recording = not self.recording
-                        if self.recording:
-                            print("Started recording")
-                        else:
-                            print("Stopped recording")
-                            # Don't save partial episodes - just discard current data
-                            if self.current_episode_data:
-                                print(f"Discarded partial episode with {len(self.current_episode_data)} steps")
-                                self.current_episode_data = []
+                        # Skip current episode - discard data and restart
+                        if current_episode_data:
+                            print(f"Skipping episode - discarded {len(current_episode_data)} steps")
+                            current_episode_data = []
+                        obs, info = self.reset_environment()
+                        done = False  # Reset done flag for new episode
+                        episode_reward = 0.0  # Reset episode reward
+                        step_count = 0  # Reset step count
+                        current_action = 0  # Reset current action
+                        # Reset episode-level world state
+                        episode_world_map = None
+                        episode_start_pos = None
+                        episode_target_pos = None
             
-            # Get current action from keyboard
-            keys = pygame.key.get_pressed()
-            self.current_action = self.get_pressed_action(keys)
-            
-            # Step environment if not done
-            if not self.done:
-                action_tensor = torch.tensor([self.current_action], device=self.device)
-                
-                # Record data if recording
-                if self.recording:
-                    self.current_episode_data.append({
-                        'obs': self.obs[0].cpu().clone(),  # Store observation
-                        'action': self.current_action,
-                        'reward': 0.0  # Will be updated after step
-                    })
-                
-                # Step environment
-                next_obs, reward, terminated, truncated, info = self.env.step(action_tensor)
-                
-                # Update game state
-                self.obs = next_obs
-                self.info = info
-                self.done = terminated[0].item() or truncated[0].item()
-                episode_reward_delta = reward[0].item()
-                self.episode_reward += episode_reward_delta
-                self.step_count += 1
-                
-                # Update reward in recorded data
-                if self.recording and self.current_episode_data:
-                    self.current_episode_data[-1]['reward'] = episode_reward_delta
-                
-                # Handle episode end
-                if self.done:
-                    success = info['success'][0].item()
-                    if success:
-                        print(f"SUCCESS! Episode finished! Reward: {self.episode_reward:.2f}, Steps: {self.step_count}")
-                    else:
-                        print(f"FAILED! Episode finished! Reward: {self.episode_reward:.2f}, Steps: {self.step_count}")
-                    
-                    if self.recording and self.current_episode_data:
-                        episode_data = {
-                            'observations': [step['obs'] for step in self.current_episode_data],
-                            'actions': [step['action'] for step in self.current_episode_data],
-                            'rewards': [step['reward'] for step in self.current_episode_data],
-                            'episode_reward': self.episode_reward,
-                            'episode_length': len(self.current_episode_data),
-                            'success': success
-                        }
-                        self.episode_count += 1
-                        self.save_episode_data(episode_data)
-                        self.current_episode_data = []
-                    
-                    # Auto-restart after a brief pause
-                    pygame.time.wait(1000)  # Wait 1 second
-                    self.reset_environment()
-            
-            # Clear screen
+            # Clear screen and render current state FIRST so player can see it
             self.screen.fill(self.WHITE)
             
             # Draw observation levels
-            if self.obs is not None:
-                for level_idx in range(self.num_levels):
-                    # Extract image and state from TensorDict observation
-                    obs_image_level = self.obs['image'][0, level_idx]  # [0] for first env, image for this level
-                    obs_state = self.obs['state'][0]  # [0] for first env, state vector
-                    
-                    surface = self.obs_level_to_pygame_surface(obs_image_level)
-                    self.draw_level_info(surface, level_idx, obs_state)
-                    
-                    x_pos = level_idx * self.level_display_size
-                    
-                    # Draw border around the image
-                    border_rect = pygame.Rect(x_pos - 2, -2, self.level_display_size + 4, self.level_display_size + 4)
-                    pygame.draw.rect(self.screen, self.BORDER_COLOR, border_rect, 2)
-                    
-                    self.screen.blit(surface, (x_pos, 0))
+            for level_idx in range(self.num_levels):
+                # Extract image and state from TensorDict observation
+                obs_image_level = obs['image'][0, level_idx]  # [0] for first env, image for this level
+                obs_state = obs['state'][0]  # [0] for first env, state vector
+                
+                surface = self.obs_level_to_pygame_surface(obs_image_level)
+                self.draw_level_info(surface, level_idx, obs_state)
+                
+                x_pos = level_idx * self.level_display_size
+                
+                # Draw border around the image
+                border_rect = pygame.Rect(x_pos - 2, -2, self.level_display_size + 4, self.level_display_size + 4)
+                pygame.draw.rect(self.screen, self.BORDER_COLOR, border_rect, 2)
+                
+                self.screen.blit(surface, (x_pos, 0))
             
             # Draw info panel
-            self.draw_info_panel()
+            self.draw_info_panel(info, done, current_action, episode_reward, step_count)
             
-            # Update display
+            # Update display so player can see the current state
             pygame.display.flip()
+            
+            # NOW get current action from keyboard after player has seen the screen
+            keys = pygame.key.get_pressed()
+            current_action = self.get_pressed_action(keys)
+            
+            # Step environment
+            action_tensor = torch.tensor([current_action], device=self.device)
+            
+            # Step environment
+            next_obs, reward, terminated, truncated, next_info = self.env.step(action_tensor)
+            
+            # Record the observation-action-reward triplet plus agent position
+            current_episode_data.append({
+                'obs': obs[0].cpu().clone(),  # Current observation that human saw
+                'action': current_action,     # Action human decided based on current obs
+                'reward': reward[0].item(),   # Reward received for this action
+                # Agent position (changes each step)
+                'agent_pos': self.env.pos[0].cpu().clone(),  # Agent x,y position in world
+            })
+            
+            # Store episode-level data only on first step
+            if step_count == 1:  # First step of episode
+                episode_world_map = self.env.cost_maps[0].cpu().clone()  # Full 512x512 world cost map
+                episode_start_pos = self.env.starts[0].cpu().clone()     # Start position for this episode
+                episode_target_pos = self.env.targets[0].cpu().clone()   # Target position for this episode
+            
+            # Update game state
+            obs = next_obs
+            info = next_info
+            done = terminated[0].item() or truncated[0].item()
+            episode_reward_delta = reward[0].item()
+            episode_reward += episode_reward_delta
+            step_count += 1
+            
+            # Handle episode end
+            if done:
+                success = info['success'][0].item()
+                if success:
+                    print(f"SUCCESS! Episode finished! Reward: {episode_reward:.2f}, Steps: {step_count}")
+                else:
+                    print(f"FAILED! Episode finished! Reward: {episode_reward:.2f}, Steps: {step_count}")
+                
+                if current_episode_data:
+                    episode_data = {
+                        'observations': [step['obs'] for step in current_episode_data],
+                        'actions': [step['action'] for step in current_episode_data],
+                        'rewards': [step['reward'] for step in current_episode_data],
+                        'agent_positions': [step['agent_pos'] for step in current_episode_data], 
+                        'world_map': episode_world_map,     # Single world map for entire episode
+                        'start_pos': episode_start_pos,     # Single start position for entire episode
+                        'target_pos': episode_target_pos,   # Single target position for entire episode
+                        'episode_reward': episode_reward,
+                        'episode_length': len(current_episode_data),
+                        'success': success
+                    }
+                    self.save_and_reset_episode(episode_data)
+                
+                # Auto-restart after a brief pause
+                pygame.time.wait(1000)  # Wait 1 second
+                obs, info = self.reset_environment()
+                done = False  # Reset done flag for new episode
+                current_episode_data = []  # Reset episode data for new episode
+                episode_reward = 0.0  # Reset episode reward
+                step_count = 0  # Reset step count
+                current_action = 0  # Reset current action
+                # Reset episode-level world state
+                episode_world_map = None
+                episode_start_pos = None
+                episode_target_pos = None
+            
             clock.tick(30)  # 30 FPS
         
         # Close HDF5 file before quitting
@@ -706,8 +757,7 @@ def main(cfg: DictConfig):
         print("\nInterrupted by user")
     finally:
         # Don't save partial episodes - only complete ones should be recorded
-        if hasattr(player, 'current_episode_data') and player.current_episode_data:
-            print(f"Discarded partial episode with {len(player.current_episode_data)} steps on exit")
+        # Note: current_episode_data is now local to run() method, so no cleanup needed here
         
         # Ensure HDF5 file is properly closed
         if hasattr(player, 'close_hdf5_file'):
