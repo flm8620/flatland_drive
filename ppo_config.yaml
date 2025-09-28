@@ -1,27 +1,16 @@
 # @package _global_
 
-# Hydra config for flat.py RL experiment
+# PPO training configuration
 
-# Environment
+defaults:
+  - env_config  # Include environment config
+
+# PPO-specific environment parameters
 env:
   num_envs: 32
-  view_size: 64
-  dt: 0.1
-  a_max: 2.0
-  v_max: 5.0
-  w_col: 1.0
-  R_goal: 100.0
-  disk_radius: 2.0
   render_dir: ${hydra:run.dir}/viz
-  video_fps: 30
-  w_dist: 5.0
-  w_accel: 0.1
-  save_viz: true
-  render_every: 10  # Render every N episodes
-  render_env_ids: [0, 5]
-  hitwall_cost: -50.0
-  pyramid_levels: [0, 2, 4]  # 2^0=1, 2^2=4, 2^4=16
-  num_levels: 3
+  
+  # Curriculum learning for PPO training
   curriculum:
     - min_start_goal_dist: 10
       max_start_goal_dist: 20
@@ -40,7 +29,7 @@ env:
       hitwall_cost: -50.0
       until_rollout: 999999
 
-# Training
+# Training hyperparameters
 train:
   resume: true
   lr: 3e-4
@@ -55,6 +44,11 @@ train:
   num_rollouts: 2000 
   fp16: false
 
+# Model selection
+model:
+  type: conv   # Options: 'vit' or 'conv'
+  vit_embed_dim: 128
+  conv_out_dim: 384
 
 # Logging
 log_dir: ${hydra:run.dir}/tb
@@ -64,13 +58,8 @@ enable_timer: true
 # Seed
 seed: 42
 
+# Output directory
 output_dir: outputs
-
-# Model selection
-model:
-  type: conv   # Options: 'vit' or 'conv'
-  vit_embed_dim: 128
-  conv_out_dim: 384
 
 # Debug and snapshot loading
 load_actor_path: null

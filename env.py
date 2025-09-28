@@ -510,7 +510,8 @@ class ParallelDrivingEnv:
             
             # Mark agent centers for all environments at once (value 128)
             center = self.view_size // 2
-            target_maps[:, center-2:center+2, center-2:center+2] = 128
+            center_draw_radius = 2
+            target_maps[:, center-center_draw_radius:center+center_draw_radius, center-center_draw_radius:center+center_draw_radius] = 128
             
             # Target position relative to top-left corner of the crop
             target_in_crop = scaled_target_pos.long() - tl_corners  # (num_envs, 2)
@@ -528,19 +529,21 @@ class ParallelDrivingEnv:
                 valid_envs = torch.where(valid_mask)[0]
                 valid_tx = tx_crop[valid_mask]
                 valid_ty = ty_crop[valid_mask]
-                
-                # Create coordinate grids for 4x4 target regions
-                target_offsets = torch.arange(-1, 3, device=self.device)
+
+                # Create coordinate grids for 3x3 target regions
+                target_draw_radius = 1
+                target_offsets = torch.arange(-target_draw_radius, target_draw_radius + 1, device=self.device)
                 dy, dx = torch.meshgrid(target_offsets, target_offsets, indexing='ij')
                 dy_flat = dy.flatten()  # (16,)
                 dx_flat = dx.flatten()  # (16,)
                 
                 # Expand for all valid environments
                 num_valid = len(valid_envs)
-                env_indices = valid_envs.repeat_interleave(16)  # (num_valid * 16,)
-                y_indices = (valid_ty.unsqueeze(1) + dy_flat.unsqueeze(0)).flatten()  # (num_valid * 16,)
-                x_indices = (valid_tx.unsqueeze(1) + dx_flat.unsqueeze(0)).flatten()  # (num_valid * 16,)
-                
+                target_draw_side = 2 * target_draw_radius + 1
+                env_indices = valid_envs.repeat_interleave(target_draw_side**2)
+                y_indices = (valid_ty.unsqueeze(1) + dy_flat.unsqueeze(0)).flatten()
+                x_indices = (valid_tx.unsqueeze(1) + dx_flat.unsqueeze(0)).flatten()
+
                 # Set target values using advanced indexing
                 target_maps[env_indices, y_indices, x_indices] = 255
             

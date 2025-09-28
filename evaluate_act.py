@@ -8,7 +8,7 @@ import os
 import torch
 import numpy as np
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 import cv2
 from tqdm import tqdm
 
@@ -19,7 +19,7 @@ from env import ParallelDrivingEnv, get_human_frame
 class ACTAgent:
     """Agent that uses trained ACT model for action prediction"""
     
-    def __init__(self, checkpoint_path: str, device='cuda'):
+    def __init__(self, checkpoint_path: str, num_levels: int, view_size: int, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
         # Load checkpoint
@@ -28,8 +28,8 @@ class ACTAgent:
         
         # Create model with same config as training
         self.model = FlatlandACT(
-            num_levels=3,  # From environment config
-            view_size=64,  # From environment config
+            num_levels=num_levels,  # From environment config
+            view_size=view_size,  # From environment config
             action_dim=model_config['action_dim'],
             chunk_size=model_config['chunk_size'],
             hidden_dim=model_config['hidden_dim'],
@@ -37,7 +37,10 @@ class ACTAgent:
             num_encoder_layers=model_config['num_encoder_layers'],
             num_decoder_layers=model_config['num_decoder_layers'],
             dim_feedforward=model_config['dim_feedforward'],
-            dropout=model_config['dropout']
+            dropout=model_config['dropout'],
+            spatial_size=model_config['spatial_size'],
+            use_cvae=model_config['use_cvae'],
+            latent_dim=model_config['latent_dim']
         ).to(self.device)
         
         # Load weights
@@ -68,7 +71,6 @@ class ACTAgent:
         
         # Generate new action chunk
         with torch.no_grad():
-            # Add batch dimension and move to device (plain dict)
             obs_batch = {
                 'image': observation['image'].unsqueeze(0).to(self.device),
                 'state': observation['state'].unsqueeze(0).to(self.device)
@@ -88,12 +90,23 @@ class ACTAgent:
         self.action_queue = []
 
 
-def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, render: bool = True):
+def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, render: bool = True, run_name: str = None):
     """Evaluate the ACT agent in the environment"""
     
-    # Create environment (single environment for evaluation)
+    # Create evaluation output directory
+    if run_name is None:
+        run_name = "evaluation"
+    
+    eval_dir = os.path.join("eval_outputs", run_name)
+    os.makedirs(eval_dir, exist_ok=True)
+    
+    if render:
+        video_dir = os.path.join(eval_dir, "videos")
+        os.makedirs(video_dir, exist_ok=True)
+    
+    # Create environment using config parameters
     env = ParallelDrivingEnv(
-        num_envs=1,
+        num_envs=cfg.env.num_envs,
         view_size=cfg.env.view_size,
         dt=cfg.env.dt,
         a_max=cfg.env.a_max,
@@ -101,16 +114,16 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
         w_col=cfg.env.w_col,
         R_goal=cfg.env.R_goal,
         disk_radius=cfg.env.disk_radius,
-        render_dir=None,  # Don't save environment videos
+        render_dir=cfg.env.render_dir,
         video_fps=cfg.env.video_fps,
         w_dist=cfg.env.w_dist,
         w_accel=cfg.env.w_accel,
-        max_steps=cfg.train.max_steps,
-        hitwall_cost=-50.0,  # Use final curriculum level
+        max_steps=cfg.env.max_steps,
+        hitwall_cost=cfg.env.hitwall_cost,
         pyramid_levels=cfg.env.pyramid_levels,
         num_levels=cfg.env.num_levels,
-        min_start_goal_dist=50,  # Challenging scenarios
-        max_start_goal_dist=200,
+        min_start_goal_dist=cfg.env.min_start_goal_dist,
+        max_start_goal_dist=cfg.env.max_start_goal_dist,
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
@@ -126,9 +139,6 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
     successes = 0
     collisions = 0
     
-    if render:
-        os.makedirs('eval_videos', exist_ok=True)
-    
     for episode in tqdm(range(num_episodes), desc="Evaluating"):
         obs, info = env.reset()
         agent.reset()
@@ -139,11 +149,18 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
         frames = []
         
         while not done:
-            # Get action from agent - obs is now TensorDict format
-            action = agent.predict_action(obs[0])  # obs[0] is TensorDict with 'image' and 'state'
+            # Get action from agent
+            obs_single = obs[0]  # Single environment observation
+            obs_dict = {
+                'image': obs_single['image'],
+                'state': obs_single['state']
+            }
             
-            # Step environment
-            obs, reward, terminated, truncated, info = env.step(torch.tensor([action]))
+            action = agent.predict_action(obs_dict)
+            
+            # Step environment - ensure action tensor is on correct device
+            action_tensor = torch.tensor([action], device=env.device)
+            obs, reward, terminated, truncated, info = env.step(action_tensor)
             
             episode_reward += reward[0].item()
             episode_length += 1
@@ -151,16 +168,12 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
             
             # Render frame if requested
             if render:
-                # Convert observation to human viewable format
-                # Need to reconstruct compatible format for get_human_frame
-                # Combine image and state for visualization
-                obs_single = obs[0]  # TensorDict for single environment
                 frame = get_human_frame(
-                    obs_single,  # Pass TensorDict directly
-                    info['vel'][0].cpu(),  # Velocity
+                    obs_single,
+                    info['vel'][0].cpu(),
                     cfg.env.v_max,
                     action=action,
-                    info={k: v[0] for k, v in info.items() if k != 'vel'},  # Single env info
+                    info={k: v[0] for k, v in info.items() if k != 'vel'},
                     a_max=cfg.env.a_max
                 )
                 frames.append(frame)
@@ -176,10 +189,10 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
         
         # Save video if rendering
         if render and frames:
-            video_path = f'eval_videos/episode_{episode:03d}.mp4'
+            video_path = os.path.join(video_dir, f'episode_{episode:03d}.avi')
             height, width = frames[0].shape[:2]
             
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
             out = cv2.VideoWriter(video_path, fourcc, 10.0, (width, height))
             
             for frame in frames:
@@ -206,40 +219,57 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
     print(f"Collision Rate: {results['collision_rate']:.1%}")
     print("="*50)
     
-    return results
+    return results, eval_dir
 
 
-@hydra.main(version_base=None, config_path=".", config_name="config")
+@hydra.main(version_base=None, config_path=".", config_name="eval_config")
 def main(cfg: DictConfig):
     """Main evaluation function"""
     
-    # Find best checkpoint
-    checkpoint_dir = "checkpoints/act_flatland"
-    checkpoint_path = os.path.join(checkpoint_dir, "best_checkpoint.pth")
+    import json
     
-    if not os.path.exists(checkpoint_path):
-        print(f"No checkpoint found at {checkpoint_path}")
-        print("Available checkpoints:")
-        if os.path.exists(checkpoint_dir):
-            for f in os.listdir(checkpoint_dir):
-                if f.endswith('.pth'):
-                    print(f"  {f}")
-        else:
-            print("  Checkpoint directory doesn't exist")
+    # Check for checkpoint_path and run_name in config
+    checkpoint_path = cfg.checkpoint_path
+    eval_run_name = cfg.run_name
+
+    if not checkpoint_path:
+        print("ERROR: checkpoint_path must be provided!")
+        print("Usage: python evaluate_act.py checkpoint_path=/path/to/checkpoint.pth")
+        print("Optional: python evaluate_act.py checkpoint_path=/path/to/checkpoint.pth run_name=my_eval")
         return
     
-    # Create agent
-    agent = ACTAgent(checkpoint_path)
+    print(f"Loading checkpoint: {checkpoint_path}")
     
-    # Run evaluation
-    results = evaluate_agent(cfg, agent, num_episodes=20, render=True)
+    # Determine run name for output organization
+    if eval_run_name:
+        run_name = eval_run_name
+        print(f"Using provided run name: {run_name}")
+    else:
+        # Extract run name from checkpoint path for organized output
+        # e.g., "checkpoints/act_flatland/run_20250926_151024/best_model.pth" -> "run_20250926_151024"
+        path_parts = checkpoint_path.split(os.sep)
+        run_name = None
+        for part in path_parts:
+            if part.startswith('run_') or part.startswith('0'):  # Handle both run_* and date formats like 0928
+                run_name = part
+                break
+        
+        if run_name is None:
+            # Fallback to checkpoint filename without extension
+            run_name = os.path.basename(checkpoint_path).replace('.pth', '')
+        
+        print(f"Auto-detected run name: {run_name}")
     
-    # Save results
-    import json
-    with open('eval_results.json', 'w') as f:
+    agent = ACTAgent(checkpoint_path, cfg.env.num_levels, cfg.env.view_size)
+    results, eval_dir = evaluate_agent(cfg, agent, num_episodes=1, render=True, run_name=run_name)
+    
+    # Save results in the evaluation directory
+    results_path = os.path.join(eval_dir, 'results.json')
+    with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     
-    print(f"Results saved to eval_results.json")
+    print(f"Results saved to {results_path}")
+    print(f"Videos saved in {os.path.join(eval_dir, 'videos')}")
 
 
 if __name__ == '__main__':

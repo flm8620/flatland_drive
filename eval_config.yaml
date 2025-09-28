@@ -1,0 +1,22 @@
+# @package _global_
+
+# ACT evaluation configuration
+
+defaults:
+  - env_config  # Include environment config
+  - _self_
+
+# Evaluation specific environment parameters
+env:
+  render_dir: ${hydra:run.dir}/viz
+  num_envs: 1  # Single environment for evaluation
+  
+# Evaluation parameters
+evaluation:
+  num_episodes: 100
+  save_video: true
+  video_every: 10  # Save video every N episodes
+
+# Command line parameters
+checkpoint_path: null  # To be provided via command line
+run_name: null  # To be provided via command line

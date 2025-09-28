@@ -120,15 +120,37 @@ class FlatlandDataset(Dataset):
         
         # Build list of valid starting positions for chunks
         self.valid_starts = []
+        initial_no_ops_skipped = 0
         print(f'dataset mode: {mode}')
         for ep in self.episodes:
             start_idx = ep['start_idx']
             length = ep['length']
-            print(f'ep start idx: {start_idx}, length: {length}')
+            
+            # Skip initial no-op actions (action 0) at the beginning of each episode
+            skip_count = 0
+            for i in range(length):  # Look at all steps until we find non-no-op
+                action_idx = start_idx + i
+                action = self.h5_file['actions'][action_idx]
+                if action == 0:  # no-op action
+                    skip_count += 1
+                else:
+                    break  # Found first non-no-op action
+            
+            # Start from first meaningful action or at least skip some initial no-ops
+            episode_start = start_idx + skip_count
+            remaining_length = length - skip_count
+            
+            if skip_count > 0:
+                initial_no_ops_skipped += skip_count
+                print(f'Episode {len(self.valid_starts)//length if length > 0 else 0}: skipped {skip_count} initial no-ops')
+            
             # Can start a chunk at any position where we have enough future actions
-            for i in range(length - chunk_size + 1):
-                self.valid_starts.append(start_idx + i)
+            # Add a stride/gap to avoid sampling too densely from consecutive frames
+            stride = 4  # Sample every 4th frame to reduce temporal correlation
+            for i in range(0, max(0, remaining_length - chunk_size + 1), stride):
+                self.valid_starts.append(episode_start + i)
         
+        print(f"Total initial no-op actions skipped: {initial_no_ops_skipped}")
         print(f"Total valid chunk starts: {len(self.valid_starts)}")
     
     def __len__(self):
@@ -489,13 +511,130 @@ class FlatlandACT(nn.Module):
         
         return logits, [mu, logvar]
     
-    def generate(self, observations):
-        """Generate actions for inference (non-autoregressive for now)"""
+    def generate(self, observations, temperature=1.0, top_k=None, top_p=None):
+        """
+        Generate actions for inference with various sampling strategies
+        
+        Args:
+            observations: Dictionary with 'image' and 'state' keys
+            temperature: Temperature for softmax sampling (1.0 = normal, >1.0 = more random, <1.0 = more confident)
+            top_k: If set, only sample from top-k most likely actions
+            top_p: If set, use nucleus sampling (sample from top actions with cumulative prob <= top_p)
+        
+        Returns:
+            actions: (batch_size, chunk_size) - sampled actions
+        """
+        self.eval()
+        with torch.no_grad():
+            logits, _ = self.forward(observations)  # (batch_size, chunk_size, action_dim)
+            
+            batch_size, chunk_size, action_dim = logits.shape
+            
+            # Apply temperature scaling
+            if temperature != 1.0:
+                logits = logits / temperature
+            
+            # Convert to probabilities
+            probs = F.softmax(logits, dim=-1)  # (batch_size, chunk_size, action_dim)
+            
+            # Apply top-k filtering if specified
+            if top_k is not None and top_k < action_dim:
+                # Get top-k indices and values
+                top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
+                
+                # Create mask for non-top-k actions
+                probs_filtered = torch.zeros_like(probs)
+                probs_filtered.scatter_(-1, top_k_indices, top_k_probs)
+                probs = probs_filtered
+            
+            # Apply nucleus (top-p) sampling if specified
+            if top_p is not None and top_p < 1.0:
+                # Sort probabilities in descending order
+                sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+                
+                # Calculate cumulative probabilities
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                
+                # Create mask for actions to keep (cumulative prob <= top_p)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Keep at least the first action
+                sorted_indices_to_remove[:, :, 0] = False
+                
+                # Convert back to original indices and set filtered probs to 0
+                indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+                probs = probs.masked_fill(indices_to_remove, 0.0)
+            
+            # Renormalize probabilities after filtering
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+            
+            # Sample from the probability distribution
+            # Flatten for multinomial sampling
+            probs_flat = probs.view(-1, action_dim)  # (batch_size * chunk_size, action_dim)
+            
+            # Sample actions
+            actions_flat = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)  # (batch_size * chunk_size,)
+            
+            # Reshape back
+            actions = actions_flat.view(batch_size, chunk_size)  # (batch_size, chunk_size)
+            
+        return actions
+    
+    def generate_deterministic(self, observations):
+        """
+        Generate actions using deterministic argmax (original behavior)
+        
+        Args:
+            observations: Dictionary with 'image' and 'state' keys  
+            
+        Returns:
+            actions: (batch_size, chunk_size) - predicted actions
+        """
         self.eval()
         with torch.no_grad():
             logits, _ = self.forward(observations)
             actions = torch.argmax(logits, dim=-1)  # (batch_size, chunk_size)
         return actions
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    Focuses learning on hard examples and down-weights easy examples.
+    """
+    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: (N, C) logits
+            targets: (N,) class indices
+        """
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)  # Probability of correct class
+        
+        # Focal weight: (1 - pt)^gamma
+        focal_weight = (1 - pt) ** self.gamma
+        
+        # Apply alpha weighting if specified
+        if self.alpha is not None:
+            if isinstance(self.alpha, (float, int)):
+                alpha_t = self.alpha
+            else:
+                alpha_t = self.alpha.gather(0, targets)
+            focal_weight = alpha_t * focal_weight
+        
+        focal_loss = focal_weight * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 
 class ACTTrainer:
@@ -541,14 +680,14 @@ class ACTTrainer:
                 h5_file_path=cfg.data.h5_file_path,
                 chunk_size=cfg.model.chunk_size,
                 episode_indices=train_episode_indices,
-                mode='train'
+                mode='train',
             )
             
             self.val_dataset = FlatlandDataset(
                 h5_file_path=cfg.data.h5_file_path,
                 chunk_size=cfg.model.chunk_size,
                 episode_indices=val_episode_indices,
-                mode='val'
+                mode='val',
             )
         
         # Create data loaders
@@ -622,14 +761,21 @@ class ACTTrainer:
         
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         
-        # Loss function
-        self.criterion = nn.CrossEntropyLoss(reduction='none')  # Don't reduce yet
+        # Loss function - use Focal Loss to handle class imbalance
+        self.criterion = FocalLoss(
+            alpha=cfg.training.focal_alpha,
+            gamma=cfg.training.focal_gamma,
+            reduction='none'  # Don't reduce yet, we'll handle masking
+        )
         
         # KL divergence weight for CVAE loss
         self.kl_weight = cfg.training.kl_weight
         
         # Initialize TensorBoard writer
         self.writer = SummaryWriter(self.log_dir)
+        
+        # Global step counter for consistent TensorBoard logging
+        self.global_step = 0
         
         logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()) / 1e6:.2f}M")
         logger.info(f"Device: {self.device}")
@@ -692,6 +838,122 @@ class ACTTrainer:
             'accuracy': accuracy
         }
     
+    def log_prediction_examples(self, logits, actions, mask, phase, num_samples=3):
+        """
+        Log prediction vs ground truth examples to TensorBoard
+        
+        Args:
+            logits: (batch_size, chunk_size, action_dim) - predicted action logits
+            actions: (batch_size, chunk_size) - ground truth actions  
+            mask: (batch_size, chunk_size) - padding mask
+            phase: 'train' or 'val'
+            epoch: current epoch number
+            batch_idx: current batch index (for train) 
+            num_samples: number of samples to log
+        """
+        batch_size = actions.size(0)
+        chunk_size = actions.size(1)
+        
+        # Get predicted actions
+        pred_actions = torch.argmax(logits, dim=-1)  # (batch_size, chunk_size)
+        
+        # Get prediction probabilities for analysis
+        pred_probs = F.softmax(logits, dim=-1)  # (batch_size, chunk_size, action_dim)
+        
+        # Sample random examples from the batch
+        sample_indices = torch.randperm(batch_size)[:min(num_samples, batch_size)]
+        
+        action_names = ["No-op", "Up", "Up-Right", "Right", "Down-Right", 
+                       "Down", "Down-Left", "Left", "Up-Left"]
+        
+        # Log individual examples
+        for i, sample_idx in enumerate(sample_indices):
+            sample_idx = sample_idx.item()
+            
+            gt_actions = actions[sample_idx].cpu().numpy()  # (chunk_size,)
+            predicted_actions = pred_actions[sample_idx].cpu().numpy()  # (chunk_size,)
+            sample_mask = mask[sample_idx].cpu().numpy()  # (chunk_size,)
+            sample_probs = pred_probs[sample_idx].detach().cpu().numpy()  # (chunk_size, action_dim)
+            
+            # Create text summary
+            text_lines = [f"=== Sample {i+1} ==="]
+            text_lines.append("Step | GT Action    | Pred Action   | Confidence | Correct")
+            text_lines.append("-" * 65)
+            
+            for step in range(chunk_size):
+                if not sample_mask[step]:
+                    continue
+                    
+                gt_action = int(gt_actions[step])
+                pred_action = int(predicted_actions[step])
+                confidence = sample_probs[step, pred_action]
+                is_correct = "✓" if gt_action == pred_action else "✗"
+                
+                gt_name = action_names[gt_action] if gt_action < len(action_names) else f"Action{gt_action}"
+                pred_name = action_names[pred_action] if pred_action < len(action_names) else f"Action{pred_action}"
+                
+                text_lines.append(f"{step:4d} | {gt_name:<12} | {pred_name:<12} | {confidence:.3f}     | {is_correct}")
+            
+            # Calculate accuracy for this sample
+            valid_steps = sample_mask.sum()
+            correct_steps = ((gt_actions == predicted_actions) * sample_mask).sum()
+            sample_accuracy = correct_steps / max(valid_steps, 1)
+            
+            text_lines.append(f"\nSample Accuracy: {sample_accuracy:.3f} ({correct_steps}/{valid_steps})")
+            
+            # Log to tensorboard with HTML formatting for monospace display
+            global_step = self.global_step if phase == 'train' else self.global_step
+            html_content = f'<pre style="font-family: monospace; font-size: 12px;">' + '\n'.join(text_lines) + '</pre>'
+            self.writer.add_text(
+                f'{phase}/prediction_examples/sample_{i+1}', 
+                html_content, 
+                global_step
+            )
+        
+        # Log action distribution statistics
+        all_gt_actions = actions[mask].detach().cpu().numpy()
+        all_pred_actions = pred_actions[mask].detach().cpu().numpy()
+        
+        # Compute action histograms
+        gt_hist = np.bincount(all_gt_actions, minlength=9)
+        pred_hist = np.bincount(all_pred_actions, minlength=9)
+        
+        # Normalize to probabilities
+        gt_dist = gt_hist / gt_hist.sum()
+        pred_dist = pred_hist / pred_hist.sum()
+        
+        # Log action distributions as bar charts
+        global_step = self.global_step
+        
+        # Create distribution comparison text
+        dist_lines = ["Action | GT Prob | Pred Prob | Difference"]
+        dist_lines.append("-" * 45)
+        for action_idx in range(9):
+            action_name = action_names[action_idx]
+            gt_prob = gt_dist[action_idx]
+            pred_prob = pred_dist[action_idx]
+            diff = pred_prob - gt_prob
+            dist_lines.append(f"{action_name:<8} | {gt_prob:.3f}   | {pred_prob:.3f}    | {diff:+.3f}")
+        
+        # Log action distribution with HTML formatting for monospace display
+        html_dist_content = f'<pre style="font-family: monospace; font-size: 12px;">' + '\n'.join(dist_lines) + '</pre>'
+        self.writer.add_text(
+            f'{phase}/action_distribution',
+            html_dist_content,
+            global_step
+        )
+        
+        # Log action distributions as histograms instead of individual scalars
+        # Create weighted samples for histogram visualization
+        gt_samples = np.repeat(np.arange(9), (gt_hist * 1000).astype(int))  # Scale up for better visualization
+        pred_samples = np.repeat(np.arange(9), (pred_hist * 1000).astype(int))
+        
+        if len(gt_samples) > 0:  # Only log if we have samples
+            self.writer.add_histogram(f'{phase}/action_dist/ground_truth', gt_samples, global_step)
+        if len(pred_samples) > 0:
+            self.writer.add_histogram(f'{phase}/action_dist/predictions', pred_samples, global_step)
+    
+    
     def train_epoch(self, epoch):
         self.model.train()
         total_loss_accum = 0
@@ -750,13 +1012,19 @@ class ACTTrainer:
             
             # Log to tensorboard
             with get_timer("tensorboard_logging"):
-                global_step = epoch * len(self.train_loader) + batch_idx
-                self.writer.add_scalar('train/loss', total_loss.item(), global_step)
-                self.writer.add_scalar('train/action_loss', valid_action_loss.item(), global_step)
+                self.writer.add_scalar('train/loss', total_loss.item(), self.global_step)
+                self.writer.add_scalar('train/action_loss', valid_action_loss.item(), self.global_step)
                 if self.model.use_cvae:
-                    self.writer.add_scalar('train/kl_loss', kl_loss.item(), global_step)
-                self.writer.add_scalar('train/accuracy', accuracy.item(), global_step)
-                self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], global_step)
+                    self.writer.add_scalar('train/kl_loss', kl_loss.item(), self.global_step)
+                self.writer.add_scalar('train/accuracy', accuracy.item(), self.global_step)
+                self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
+                
+                # Log prediction examples only on the first batch to avoid too much logging
+                if batch_idx == 0:
+                    self.log_prediction_examples(logits, actions, mask, 'train', num_samples=1)
+                
+                # Increment global step after each training batch
+                self.global_step += 1
 
             print_timing_report()
         avg_loss = total_loss_accum / num_batches
@@ -807,6 +1075,10 @@ class ACTTrainer:
                         total_acc += accuracy.item()
                         num_batches += 1
                         
+                        # Log prediction examples on the first batch of each validation
+                        if batch_idx == 0:
+                            self.log_prediction_examples(logits, actions, mask, 'val', num_samples=3)
+                        
                         pbar.set_postfix({
                             'loss': f"{valid_loss.item():.4f}",
                             'acc': f"{accuracy.item():.3f}"
@@ -822,8 +1094,8 @@ class ACTTrainer:
         
         # Log to tensorboard (only for actual training epochs, not initial validation)
         if epoch >= 0:
-            self.writer.add_scalar('val/loss', avg_loss, epoch)
-            self.writer.add_scalar('val/accuracy', avg_acc, epoch)
+            self.writer.add_scalar('val/loss', avg_loss, self.global_step)
+            self.writer.add_scalar('val/accuracy', avg_acc, self.global_step)
         
         return avg_loss, avg_acc
     

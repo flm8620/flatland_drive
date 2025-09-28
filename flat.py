@@ -334,8 +334,8 @@ def collect_rollout(cfg, device, rollout_idx, run_dir, actor, critic, writer):
     writer.add_scalar('Reward/AvgFailure', np.mean(avg_failures_per_env), rollout_idx)
     if render_this_rollout and video_frames is not None:
         for env_id in cfg.env.render_env_ids:
-            video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}_env{env_id}.mp4")
-            imageio.mimsave(video_path, video_frames[env_id], fps=cfg.env.video_fps, codec='libx264')
+            video_path = os.path.join(run_dir, f"rollout_{rollout_idx:05d}_env{env_id}.avi")
+            imageio.mimsave(video_path, video_frames[env_id], fps=cfg.env.video_fps, codec='mjpeg')
     
     return buffer
 
@@ -545,7 +545,7 @@ def train(cfg: DictConfig):
     writer.close()
 
 
-@hydra.main(version_base=None, config_path=".", config_name="config")
+@hydra.main(version_base=None, config_path=".", config_name="ppo_config")
 def main(cfg: DictConfig):
     print("Config:\n", OmegaConf.to_yaml(cfg))
     train(cfg)

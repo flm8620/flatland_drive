@@ -1,0 +1,16 @@
+# @package _global_
+
+# Human player configuration
+
+defaults:
+  - env_config  # Include environment config
+
+# Human player specific environment parameters
+env:
+  render_dir: null  # No video rendering for human player
+
+# Seed
+seed: 42
+
+# Output directory for human data
+output_dir: human_data

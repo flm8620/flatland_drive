@@ -64,7 +64,7 @@ class HumanPlayer:
             video_fps=cfg.env.video_fps,
             w_dist=cfg.env.w_dist,
             w_accel=cfg.env.w_accel,
-            max_steps=cfg.train.max_steps,
+            max_steps=10000,
             hitwall_cost=cfg.env.hitwall_cost,
             pyramid_levels=cfg.env.pyramid_levels,
             num_levels=cfg.env.num_levels,
@@ -743,7 +743,7 @@ class HumanPlayer:
         pygame.quit()
 
 
-@hydra.main(version_base=None, config_path=".", config_name="config")
+@hydra.main(version_base=None, config_path=".", config_name="human_config")
 def main(cfg: DictConfig):
     """Main function to run human player"""
     print("Starting Human Player...")
