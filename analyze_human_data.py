@@ -186,8 +186,8 @@ def visualize_world_trajectory(filepath, episode_idx, output_path):
         # Load trajectory data
         agent_positions = h5file['agent_positions'][start_idx:start_idx + length]  # Shape: (length, 2)
         
-        # Get episode-level world state data from episode metadata
-        world_map = episode['world_map']  # Shape: (512, 512)
+        # Get episode-level world state data
+        world_map = h5file['world_maps'][episode_idx]  # Shape: (512, 512)
         start_pos = episode['start_pos']  # Shape: (2,)
         target_pos = episode['target_pos']  # Shape: (2,)
         
@@ -268,8 +268,8 @@ def episode_to_video(filepath, episode_idx, output_path, fps=5):
         rewards = h5file['rewards'][start_idx:start_idx + length]
         agent_positions = h5file['agent_positions'][start_idx:start_idx + length]  # Shape: (length, 2)
         
-        # Get episode-level world state data from episode metadata
-        world_map = episode['world_map']  # Shape: (512, 512)
+        # Get episode-level world state data
+        world_map = h5file['world_maps'][episode_idx]  # Shape: (512, 512)
         start_pos = episode['start_pos']  # Shape: (2,)
         target_pos = episode['target_pos']  # Shape: (2,)
         

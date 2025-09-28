@@ -41,61 +41,199 @@ def reparametrize(mu, logvar):
     return mu + std * eps
 
 
-def create_episode_split(h5_file_path: str, train_split: float = 0.8, random_seed: int = 42):
+def analyze_and_filter_segments(h5_file_path: str, 
+                               chunk_size: int,
+                               stride: int,
+                               max_no_op_ratio: float,
+                               min_meaningful_actions: int,
+                               verbose: bool = True):
     """
-    Create explicit train/val episode splits for reproducible dataset creation.
+    Cut episodes into segments (chunks) and filter segments based on action distribution.
     
     Args:
         h5_file_path: Path to the H5 file containing demonstrations
-        train_split: Fraction of episodes to use for training
-        random_seed: Random seed for reproducible splits
+        chunk_size: Size of each segment/chunk
+        stride: Stride between segment starts
+        max_no_op_ratio: Maximum allowed ratio of no-op actions in a segment
+        min_meaningful_actions: Minimum number of meaningful (non-no-op) actions per segment
+        verbose: Whether to print filtering statistics
     
     Returns:
-        tuple: (train_episode_indices, val_episode_indices)
+        dict: Contains episode indices and their valid segment starts
     """
     with h5py.File(h5_file_path, 'r') as h5_file:
         total_episodes = h5_file.attrs['total_episodes']
+        episodes = h5_file['episodes'][:total_episodes]
+        
+        if verbose:
+            print(f"=== ANALYZING AND FILTERING SEGMENTS ===")
+            print(f"Total episodes: {total_episodes}")
+            print(f"Chunk size: {chunk_size}, Stride: {stride}")
+            print(f"Filtering criteria:")
+            print(f"  - Max no-op ratio per segment: {max_no_op_ratio:.2f}")
+            print(f"  - Min meaningful actions per segment: {min_meaningful_actions}")
+        
+        # Process each episode and extract valid segments
+        episode_segment_data = {}
+        total_segments_found = 0
+        total_segments_kept = 0
+        total_no_ops_before = 0
+        total_no_ops_after = 0
+        total_actions_before = 0
+        total_actions_after = 0
+        
+        for ep_idx in range(total_episodes):
+            episode = episodes[ep_idx]
+            start_idx = int(episode['start_idx'])
+            length = int(episode['length'])
+            
+            # Skip initial no-op actions at the beginning of each episode
+            skip_count = 0
+            for i in range(length):
+                action_idx = start_idx + i
+                action = h5_file['actions'][action_idx]
+                if action == 0:  # no-op action
+                    skip_count += 1
+                else:
+                    break  # Found first non-no-op action
+            
+            episode_start = start_idx + skip_count
+            remaining_length = length - skip_count
+            
+            # Generate all possible segments for this episode
+            valid_segment_starts = []
+            
+            for i in range(0, max(0, remaining_length - chunk_size + 1), stride):
+                segment_start = episode_start + i
+                
+                # Analyze the action distribution in this segment
+                segment_actions = h5_file['actions'][segment_start:segment_start + chunk_size]
+                no_op_count = np.sum(segment_actions == 0)
+                meaningful_count = chunk_size - no_op_count
+                no_op_ratio = no_op_count / chunk_size
+                
+                total_segments_found += 1
+                total_no_ops_before += no_op_count
+                total_actions_before += chunk_size
+                
+                # Apply filtering criteria
+                if no_op_ratio <= max_no_op_ratio and meaningful_count >= min_meaningful_actions:
+                    valid_segment_starts.append(int(segment_start))
+                    total_segments_kept += 1
+                    total_no_ops_after += no_op_count
+                    total_actions_after += chunk_size
+            
+            if len(valid_segment_starts) > 0:
+                episode_segment_data[int(ep_idx)] = valid_segment_starts
+        
+        if verbose:
+            print(f"\n=== SEGMENT FILTERING RESULTS ===")
+            print(f"Episodes with valid segments: {len(episode_segment_data)} / {total_episodes}")
+            print(f"Total segments found: {total_segments_found}")
+            print(f"Segments kept: {total_segments_kept} ({total_segments_kept/total_segments_found*100:.1f}%)")
+            print(f"Segments rejected: {total_segments_found - total_segments_kept} ({(total_segments_found - total_segments_kept)/total_segments_found*100:.1f}%)")
+            
+            # Calculate no-op ratio improvement
+            no_op_ratio_before = total_no_ops_before / total_actions_before if total_actions_before > 0 else 0
+            no_op_ratio_after = total_no_ops_after / total_actions_after if total_actions_after > 0 else 0
+            
+            print(f"No-op ratio before filtering: {no_op_ratio_before:.3f} ({no_op_ratio_before*100:.1f}%)")
+            print(f"No-op ratio after filtering: {no_op_ratio_after:.3f} ({no_op_ratio_after*100:.1f}%)")
+            print(f"No-op ratio improvement: {(no_op_ratio_before - no_op_ratio_after)*100:.1f} percentage points")
+            print(f"Total training segments after filtering: {total_segments_kept}")
+        
+        return episode_segment_data
+
+
+def create_episode_split(h5_file_path: str, 
+                        chunk_size: int,
+                        train_split: float, 
+                        random_seed: int,
+                        max_no_op_ratio: float, 
+                        min_meaningful_actions: int,
+                        stride: int):
+    """
+    Create explicit train/val episode splits for reproducible dataset creation.
+    Episodes are processed to extract valid segments, then segments are split into train/val.
     
-    # Create reproducible episode indices
+    Args:
+        h5_file_path: Path to the H5 file containing demonstrations
+        chunk_size: Size of each segment/chunk
+        train_split: Fraction of episodes to use for training
+        random_seed: Random seed for reproducible splits
+        max_no_op_ratio: Maximum allowed ratio of no-op actions in a segment
+        min_meaningful_actions: Minimum number of meaningful actions per segment
+        stride: Stride between segment starts
+    
+    Returns:
+        tuple: (train_episode_segment_data, val_episode_segment_data)
+        Each is a dict mapping episode_idx -> list of valid segment starts
+    """
+    # First, filter segments to reduce no-op bias
+    all_episode_segment_data = analyze_and_filter_segments(
+        h5_file_path, 
+        chunk_size=chunk_size,
+        stride=stride,
+        max_no_op_ratio=max_no_op_ratio,
+        min_meaningful_actions=min_meaningful_actions,
+        verbose=True
+    )
+    
+    if len(all_episode_segment_data) == 0:
+        raise ValueError("No episodes have valid segments. Consider relaxing the filtering constraints.")
+    
+    # Get episodes that have valid segments
+    episodes_with_valid_segments = list(all_episode_segment_data.keys())
+    
+    # Create reproducible episode indices from episodes with valid segments
     np.random.seed(random_seed)
-    all_indices = np.arange(total_episodes)
-    np.random.shuffle(all_indices)
+    np.random.shuffle(episodes_with_valid_segments)
     
     # Split based on train_split
-    split_idx = int(total_episodes * train_split)
-    train_indices = all_indices[:split_idx]
-    val_indices = all_indices[split_idx:]
+    split_idx = int(len(episodes_with_valid_segments) * train_split)
+    train_episode_indices = episodes_with_valid_segments[:split_idx]
+    val_episode_indices = episodes_with_valid_segments[split_idx:]
     
     # Sort indices to maintain some ordering
-    train_indices = np.sort(train_indices)
-    val_indices = np.sort(val_indices)
+    train_episode_indices = sorted(train_episode_indices)
+    val_episode_indices = sorted(val_episode_indices)
     
-    print(f"Episode split - Train: {len(train_indices)} episodes, Val: {len(val_indices)} episodes")
-    print(f"Train episodes: {train_indices[:10]}{'...' if len(train_indices) > 10 else ''}")
-    print(f"Val episodes: {val_indices[:10]}{'...' if len(val_indices) > 10 else ''}")
+    # Split the episode segment data into train/val
+    train_episode_segment_data = {ep_idx: all_episode_segment_data[ep_idx] for ep_idx in train_episode_indices}
+    val_episode_segment_data = {ep_idx: all_episode_segment_data[ep_idx] for ep_idx in val_episode_indices}
     
-    return train_indices, val_indices
+    print(f"\n=== FINAL EPISODE SPLIT ===")
+    print(f"Episodes with valid segments: {len(episodes_with_valid_segments)}")
+    print(f"Train: {len(train_episode_indices)} episodes, Val: {len(val_episode_indices)} episodes")
+    print(f"Train episodes: {train_episode_indices[:10]}{'...' if len(train_episode_indices) > 10 else ''}")
+    print(f"Val episodes: {val_episode_indices[:10]}{'...' if len(val_episode_indices) > 10 else ''}")
+    
+    return train_episode_segment_data, val_episode_segment_data
 
 
 class FlatlandDataset(Dataset):
     """Dataset for loading Flatland human demonstration data from H5 files."""
     
     def __init__(self, h5_file_path: str, chunk_size: int = 32, 
-                 episode_indices: np.ndarray = None, mode: str = 'train'):
+                 episode_segment_data: dict = None,
+                 mode: str = 'train'):
         """
         Args:
             h5_file_path: Path to the H5 file containing demonstrations
             chunk_size: Number of actions to predict per observation
-            episode_indices: Explicit array of episode indices to use for this split
+            episode_segment_data: Dictionary mapping episode indices to valid segment starts
             mode: 'train' or 'val' (used for logging only)
         """
-        if episode_indices is None:
-            raise ValueError("episode_indices must be provided. Use create_episode_split() to generate them.")
+        if episode_segment_data is None:
+            raise ValueError("episode_segment_data must be provided. Use create_episode_split() to generate it.")
         
         self.h5_file_path = h5_file_path
         self.chunk_size = chunk_size
         self.mode = mode
-        self.episode_indices = episode_indices
+        self.episode_segment_data = episode_segment_data
+        
+        # Extract episode indices from the segment data
+        self.episode_indices = list(episode_segment_data.keys())
         
         # Open HDF5 file and keep it open for the dataset lifetime
         self.h5_file = h5py.File(h5_file_path, 'r')
@@ -106,52 +244,50 @@ class FlatlandDataset(Dataset):
         self.num_levels = self.h5_file.attrs['num_levels']
         
         # Validate episode indices
-        if np.max(episode_indices) >= total_episodes:
-            raise ValueError(f"Episode index {np.max(episode_indices)} >= total episodes {total_episodes}")
+        if len(self.episode_indices) > 0 and np.max(self.episode_indices) >= total_episodes:
+            raise ValueError(f"Episode index {np.max(self.episode_indices)} >= total episodes {total_episodes}")
         
         # Load episode metadata for selected episodes only
         episodes_array = self.h5_file['episodes']
         assert len(episodes_array) == total_episodes, \
             f"Episodes array length {len(episodes_array)} does not match total_episodes {total_episodes}"
         
-        self.episodes = episodes_array[episode_indices]
+        if len(self.episode_indices) > 0:
+            self.episodes = episodes_array[self.episode_indices]
+        else:
+            self.episodes = []
         
-        print(f"{mode.capitalize()} split: {len(self.episodes)} episodes (indices: {len(episode_indices)})")
+        print(f"{mode.capitalize()} split: {len(self.episodes)} episodes (indices: {len(self.episode_indices)})")
         
-        # Build list of valid starting positions for chunks
+        # Build list of valid starting positions from pre-filtered segments
         self.valid_starts = []
-        initial_no_ops_skipped = 0
-        print(f'dataset mode: {mode}')
-        for ep in self.episodes:
-            start_idx = ep['start_idx']
-            length = ep['length']
-            
-            # Skip initial no-op actions (action 0) at the beginning of each episode
-            skip_count = 0
-            for i in range(length):  # Look at all steps until we find non-no-op
-                action_idx = start_idx + i
-                action = self.h5_file['actions'][action_idx]
-                if action == 0:  # no-op action
-                    skip_count += 1
-                else:
-                    break  # Found first non-no-op action
-            
-            # Start from first meaningful action or at least skip some initial no-ops
-            episode_start = start_idx + skip_count
-            remaining_length = length - skip_count
-            
-            if skip_count > 0:
-                initial_no_ops_skipped += skip_count
-                print(f'Episode {len(self.valid_starts)//length if length > 0 else 0}: skipped {skip_count} initial no-ops')
-            
-            # Can start a chunk at any position where we have enough future actions
-            # Add a stride/gap to avoid sampling too densely from consecutive frames
-            stride = 4  # Sample every 4th frame to reduce temporal correlation
-            for i in range(0, max(0, remaining_length - chunk_size + 1), stride):
-                self.valid_starts.append(episode_start + i)
         
-        print(f"Total initial no-op actions skipped: {initial_no_ops_skipped}")
-        print(f"Total valid chunk starts: {len(self.valid_starts)}")
+        print(f'Dataset mode: {mode}')
+        for ep_idx in self.episode_indices:
+            segment_starts = self.episode_segment_data[ep_idx]
+            self.valid_starts.extend(segment_starts)
+            print(f'Episode {ep_idx}: added {len(segment_starts)} pre-filtered segments')
+        
+        print(f"Total valid segment starts: {len(self.valid_starts)}")
+        
+        # Print final statistics by sampling a few segments
+        if len(self.valid_starts) > 0:
+            # Sample some segments to verify no-op ratio
+            sample_size = min(100, len(self.valid_starts))
+            sample_indices = np.random.choice(len(self.valid_starts), sample_size, replace=False)
+            total_sampled_actions = 0
+            total_sampled_no_ops = 0
+            
+            for sample_idx in sample_indices:
+                segment_start = self.valid_starts[sample_idx]
+                segment_actions = self.h5_file['actions'][segment_start:segment_start + chunk_size]
+                total_sampled_actions += len(segment_actions)
+                total_sampled_no_ops += np.sum(segment_actions == 0)
+            
+            final_no_op_ratio = total_sampled_no_ops / total_sampled_actions if total_sampled_actions > 0 else 0
+            print(f"Final estimated no-op ratio in {mode} data: {final_no_op_ratio:.3f} ({final_no_op_ratio*100:.1f}%)")
+        else:
+            print("WARNING: No valid segments found!")
     
     def __len__(self):
         return len(self.valid_starts)
@@ -668,25 +804,34 @@ class ACTTrainer:
         
         # Create explicit episode splits for reproducible train/val separation
         with get_timer("episode_split_creation"):
-            train_episode_indices, val_episode_indices = create_episode_split(
+            # Get filtering parameters from config (with defaults)
+            max_no_op_ratio = cfg.data.max_no_op_ratio
+            min_meaningful_actions = cfg.data.min_meaningful_actions
+            stride = cfg.data.stride
+
+            train_episode_segment_data, val_episode_segment_data = create_episode_split(
                 h5_file_path=cfg.data.h5_file_path,
+                chunk_size=cfg.model.chunk_size,
                 train_split=cfg.data.train_split,
-                random_seed=getattr(cfg.data, 'split_seed', 42)  # Allow configurable seed
+                random_seed=getattr(cfg.data, 'split_seed', 42),  # Allow configurable seed
+                max_no_op_ratio=max_no_op_ratio,
+                min_meaningful_actions=min_meaningful_actions,
+                stride=stride
             )
         
-        # Create datasets with explicit episode indices
+        # Create datasets with episode segment data
         with get_timer("dataset_creation"):
             self.train_dataset = FlatlandDataset(
                 h5_file_path=cfg.data.h5_file_path,
                 chunk_size=cfg.model.chunk_size,
-                episode_indices=train_episode_indices,
+                episode_segment_data=train_episode_segment_data,
                 mode='train',
             )
             
             self.val_dataset = FlatlandDataset(
                 h5_file_path=cfg.data.h5_file_path,
                 chunk_size=cfg.model.chunk_size,
-                episode_indices=val_episode_indices,
+                episode_segment_data=val_episode_segment_data,
                 mode='val',
             )
         
@@ -713,7 +858,7 @@ class ACTTrainer:
             self.val_loader = DataLoader(
                 self.val_dataset,
                 batch_size=cfg.training.batch_size,
-                shuffle=False,
+                shuffle=True,
                 num_workers=cfg.training.num_workers,
                 pin_memory=True,
                 worker_init_fn=worker_init_fn
@@ -1046,43 +1191,42 @@ class ACTTrainer:
                 pbar = tqdm(range(len(self.val_loader)), desc=f"Epoch {epoch+1} Validation")
                 
                 for batch_idx in pbar:
-                    with get_timer("val_batch_processing"):
-                        
+                    with get_timer("fetch_data"):
                         batch = next(dataloader_iter)
-                        
-                        with get_timer("val_data_transfer"):
-                            # Transfer dictionary of observations to device
-                            observations = batch['observations']
-                            observations = {
-                                'image': observations['image'].to(self.device),
-                                'state': observations['state'].to(self.device)
-                            }
-                            actions = batch['actions'].to(self.device)
-                            mask = batch['mask'].to(self.device)
-                        
-                        # Forward pass
-                        with get_timer("val_forward_pass"):
-                            logits, latent_info = self.model(observations, actions, mask)
-                            mu, logvar = latent_info
-                        
-                        # Compute loss and accuracy
-                        with get_timer("val_loss_computation"):
-                            loss_dict = self.compute_loss_and_accuracy(logits, actions, mask, latent_info)
-                            valid_loss = loss_dict['total_loss']
-                            accuracy = loss_dict['accuracy']
-                        
-                        total_loss += valid_loss.item()
-                        total_acc += accuracy.item()
-                        num_batches += 1
-                        
-                        # Log prediction examples on the first batch of each validation
-                        if batch_idx == 0:
-                            self.log_prediction_examples(logits, actions, mask, 'val', num_samples=3)
-                        
-                        pbar.set_postfix({
-                            'loss': f"{valid_loss.item():.4f}",
-                            'acc': f"{accuracy.item():.3f}"
-                        })
+                    
+                    with get_timer("val_data_transfer"):
+                        # Transfer dictionary of observations to device
+                        observations = batch['observations']
+                        observations = {
+                            'image': observations['image'].to(self.device),
+                            'state': observations['state'].to(self.device)
+                        }
+                        actions = batch['actions'].to(self.device)
+                        mask = batch['mask'].to(self.device)
+                    
+                    # Forward pass
+                    with get_timer("val_forward_pass"):
+                        logits, latent_info = self.model(observations, actions, mask)
+                        mu, logvar = latent_info
+                    
+                    # Compute loss and accuracy
+                    with get_timer("val_loss_computation"):
+                        loss_dict = self.compute_loss_and_accuracy(logits, actions, mask, latent_info)
+                        valid_loss = loss_dict['total_loss']
+                        accuracy = loss_dict['accuracy']
+                    
+                    total_loss += valid_loss.item()
+                    total_acc += accuracy.item()
+                    num_batches += 1
+                    
+                    # Log prediction examples on the first batch of each validation
+                    if batch_idx == 0:
+                        self.log_prediction_examples(logits, actions, mask, 'val', num_samples=3)
+                    
+                    pbar.set_postfix({
+                        'loss': f"{valid_loss.item():.4f}",
+                        'acc': f"{accuracy.item():.3f}"
+                    })
         
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches

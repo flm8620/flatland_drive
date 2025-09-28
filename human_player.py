@@ -347,7 +347,7 @@ class HumanPlayer:
         
         # Verify file structure is compatible (new format with separate image/state)
         required_datasets = ['obs_images', 'obs_states', 'actions', 'rewards', 'episodes', 
-                           'agent_positions']
+                           'agent_positions', 'world_maps']
         for dataset_name in required_datasets:
             if dataset_name not in self.hdf5_file:
                 raise ValueError(f"Existing HDF5 file missing required dataset: {dataset_name}")
@@ -370,6 +370,7 @@ class HumanPlayer:
         self.actions_dataset = self.hdf5_file['actions']
         self.rewards_dataset = self.hdf5_file['rewards']
         self.episodes_dataset = self.hdf5_file['episodes']
+        self.world_maps_dataset = self.hdf5_file['world_maps']
         
         # Get world state datasets (only agent positions per step)
         self.agent_positions_dataset = self.hdf5_file['agent_positions']
@@ -440,7 +441,7 @@ class HumanPlayer:
             chunks=(chunk_size, 2)  # No compression for positions
         )
         
-        # Episode metadata: [num_episodes]
+        # Episode metadata: [num_episodes] - keep metadata small
         self.episodes_dataset = self.hdf5_file.create_dataset(
             'episodes',
             shape=(initial_episodes,),
@@ -451,11 +452,21 @@ class HumanPlayer:
                 ('reward', 'f4'),         # Total episode reward
                 ('success', 'b1'),        # Success flag
                 ('timestamp', 'S20'),     # Timestamp string
-                ('world_map', 'f4', (512, 512)),  # World cost map for this episode
                 ('start_pos', 'i4', (2,)),        # Start position [x, y]
                 ('target_pos', 'i4', (2,))        # Target position [x, y]
             ],
-            chunks=(100,)
+            chunks=(1,)  # Use chunk size of 1 for random access
+        )
+        
+        # World maps: [num_episodes, 512, 512] - stored separately
+        self.world_maps_dataset = self.hdf5_file.create_dataset(
+            'world_maps',
+            shape=(initial_episodes, 512, 512),
+            maxshape=(None, 512, 512),
+            dtype=np.float32,
+            chunks=(1, 512, 512),  # One world map per chunk
+            compression='gzip',
+            compression_opts=6  # Higher compression for world maps
         )
         
         # Store metadata
@@ -495,6 +506,7 @@ class HumanPlayer:
         if required_episodes > current_episodes:
             new_size = max(required_episodes, int(current_episodes * 1.5))
             self.episodes_dataset.resize((new_size,))
+            self.world_maps_dataset.resize((new_size, 512, 512))
 
     def save_and_reset_episode(self, episode_data):
         """Save episode data to HDF5 file and reset episode tracking"""
@@ -556,7 +568,7 @@ class HumanPlayer:
         # Write agent positions (per-step data)
         self.agent_positions_dataset[start_idx:end_idx] = agent_positions_array
         
-        # Write episode metadata (including world-level data)
+        # Write episode metadata (excluding world map)
         episode_record = np.array([
             (
                 start_idx,
@@ -564,13 +576,15 @@ class HumanPlayer:
                 episode_data['episode_reward'],
                 episode_data.get('success', False),
                 time.strftime("%Y%m%d_%H%M%S").encode('utf-8'),
-                world_map_array,  # Store world map in episode metadata
                 start_pos_array,  # Store start position in episode metadata
                 target_pos_array  # Store target position in episode metadata
             )
         ], dtype=self.episodes_dataset.dtype)
         
         self.episodes_dataset[self.episode_count] = episode_record[0]
+        
+        # Write world map separately
+        self.world_maps_dataset[self.episode_count] = world_map_array
         
         # Update counters
         self.total_steps_recorded += episode_length
@@ -579,7 +593,7 @@ class HumanPlayer:
         if self.episode_count % 10 == 0:
             self.hdf5_file.flush()
         
-        print(f"Saved episode {self.episode_count} with {episode_length} steps (total steps: {self.total_steps_recorded}) + world state data")
+        print(f"Saved episode {self.episode_count} with {episode_length} steps (total steps: {self.total_steps_recorded}) + world map data")
         
         # Increment episode count after successful save
         self.episode_count += 1
@@ -610,6 +624,7 @@ class HumanPlayer:
             
             if self.episode_count > 0:
                 self.episodes_dataset.resize((self.episode_count,))
+                self.world_maps_dataset.resize((self.episode_count, 512, 512))
             
             self.hdf5_file.close()
             print(f"Closed HDF5 file with {self.episode_count} episodes and {self.total_steps_recorded} steps")
