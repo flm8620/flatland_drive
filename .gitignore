@@ -179,5 +179,5 @@ outputs/
 .vscode/
 
 human_data/
-outputs_act/
+outputs_imi/
 eval_outputs

@@ -7,8 +7,9 @@ data:
   split_seed: 42  # Random seed for reproducible train/val episode splits
   # Segment-level action distribution filtering to reduce no-op bias
   max_no_op_ratio: 0.8    # Maximum allowed ratio of no-op actions in a segment (0.0-1.0)
-  min_meaningful_actions: 3  # Minimum number of meaningful (non-no-op) actions required per segment
-  stride: 16  # Stride between segment starts
+  stride: 4  # Stride between segment starts
+  # Flexible filtering: percentage of segments that must meet no-op filtering criteria
+  no_op_filter_percentage: 1.0  # 1.0 = strict filtering (all segments must pass), 0.7 = 70% must pass
 
 # Model architecture
 model:
@@ -31,7 +32,7 @@ training:
   batch_size: 128
   lr: 1e-4
   weight_decay: 1e-4
-  num_workers: 0
+  num_workers: 4
   # CVAE loss weight
   kl_weight: 1.0
   # Focal loss parameters to handle class imbalance
@@ -40,7 +41,7 @@ training:
 
 # Logging and checkpoints
 logging:
-  output_dir: "outputs_act"
+  output_dir: "outputs_imi"
   save_interval: 5  # Save checkpoint every N epochs
 
 # Run configuration
