@@ -12,8 +12,8 @@ from omegaconf import DictConfig
 import cv2
 from tqdm import tqdm
 
-from flatland_act import FlatlandACT
-from env import ParallelDrivingEnv, get_human_frame
+from imitation.train_act import FlatlandACT
+from env.env import ParallelDrivingEnv, get_human_frame
 
 
 class ACTAgent:
@@ -222,7 +222,7 @@ def evaluate_agent(cfg: DictConfig, agent: ACTAgent, num_episodes: int = 10, ren
     return results, eval_dir
 
 
-@hydra.main(version_base=None, config_path=".", config_name="eval_config")
+@hydra.main(version_base=None, config_path="../config", config_name="eval_config")
 def main(cfg: DictConfig):
     """Main evaluation function"""
     

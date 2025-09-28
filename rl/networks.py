@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 # Import proper ViT with RoPE implementation
-from vit_rope import ViTEncoder
+from utils.vit_rope import ViTEncoder
 
 # --- ViT with RoPE (Fixed Implementation) ---
 class ViTEncoderWrapper(nn.Module):

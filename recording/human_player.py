@@ -16,7 +16,7 @@ from collections import deque
 from omegaconf import DictConfig, OmegaConf
 import hydra
 
-from env import ParallelDrivingEnv, get_human_frame
+from env.env import ParallelDrivingEnv, get_human_frame
 
 
 class HumanPlayer:
@@ -779,7 +779,7 @@ class HumanPlayer:
         pygame.quit()
 
 
-@hydra.main(version_base=None, config_path=".", config_name="human_config")
+@hydra.main(version_base=None, config_path="../config", config_name="human_config")
 def main(cfg: DictConfig):
     """Main function to run human player"""
     print("Starting Human Player...")

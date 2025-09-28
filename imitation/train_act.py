@@ -24,10 +24,10 @@ from omegaconf import DictConfig, OmegaConf
 from hydra.utils import to_absolute_path
 
 # Import timer utilities
-from timer import get_timer, set_timing_enabled, reset_timer, print_timing_report
+from utils.timer import get_timer, set_timing_enabled, reset_timer, print_timing_report
 
 # Import proper ViT with RoPE
-from vit_rope import ViTSpatialEncoder
+from utils.vit_rope import ViTSpatialEncoder
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -1306,7 +1306,7 @@ class ACTTrainer:
         self.writer.close()
 
 
-@hydra.main(version_base=None, config_path=".", config_name="act_config")
+@hydra.main(version_base=None, config_path="../config", config_name="act_config")
 def main(cfg: DictConfig):
     print("Config:\n", OmegaConf.to_yaml(cfg))
     

@@ -47,10 +47,9 @@ from tensordict import TensorDict
 # Set multiprocessing start method to 'spawn' for CUDA compatibility
 multiprocessing.set_start_method('spawn', force=True)
 
-
-from env import ParallelDrivingEnv, get_human_frame
-from networks import ViTEncoder, ConvEncoder
-from timer import get_timer, set_timing_enabled, reset_timer, print_timing_report
+from env.env import ParallelDrivingEnv, get_human_frame
+from rl.networks import ViTEncoder, ConvEncoder
+from utils.timer import get_timer, set_timing_enabled, reset_timer, print_timing_report
 
 
 def make_encoder(cfg, view_size, num_levels):
@@ -545,7 +544,7 @@ def train(cfg: DictConfig):
     writer.close()
 
 
-@hydra.main(version_base=None, config_path=".", config_name="ppo_config")
+@hydra.main(version_base=None, config_path="../config", config_name="ppo_config")
 def main(cfg: DictConfig):
     print("Config:\n", OmegaConf.to_yaml(cfg))
     train(cfg)
