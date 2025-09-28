@@ -793,7 +793,7 @@ class ACTTrainer:
             # Backward pass
             with get_timer("backward_pass"):
                 total_loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 self.optimizer.step()
                 self.scheduler.step()  # Update learning rate after each step
             
@@ -805,7 +805,8 @@ class ACTTrainer:
             pbar.set_postfix({
                 'loss': f"{total_loss.item():.4f}",
                 'acc': f"{accuracy.item():.3f}",
-                'kl': f"{kl_loss.item():.4f}" if self.model.use_cvae else "0.0000"
+                'kl': f"{kl_loss.item():.4f}" if self.model.use_cvae else "0.0000",
+                'grad': f"{grad_norm:.3f}"
             })
             
             # Log to tensorboard
@@ -816,6 +817,7 @@ class ACTTrainer:
                     self.writer.add_scalar('train/kl_loss', kl_loss.item(), self.global_step)
                 self.writer.add_scalar('train/accuracy', accuracy.item(), self.global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
+                self.writer.add_scalar('train/grad_norm', grad_norm, self.global_step)
                 
                 # Log prediction examples only on the first batch to avoid too much logging
                 if batch_idx == 0:

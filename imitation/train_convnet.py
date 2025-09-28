@@ -168,7 +168,10 @@ class FlatlandConvNet(nn.Module):
             nn.Dropout(dropout),
         )
         
-        # Action prediction head
+        # Add layer normalization before final prediction to stabilize logits
+        self.pre_action_norm = nn.LayerNorm(hidden_dim // 2)
+        
+        # Action prediction head - using smaller hidden dimension helps keep logits reasonable
         self.action_head = nn.Linear(hidden_dim // 2, action_dim)
     
     def forward(self, observations):
@@ -206,10 +209,42 @@ class FlatlandConvNet(nn.Module):
         combined_features = torch.cat([spatial_features, state_features], dim=1)  # (B, hidden_dim + 64)
         fused_features = self.fusion(combined_features)  # (B, hidden_dim // 2)
         
-        # Predict action
-        logits = self.action_head(fused_features)  # (B, action_dim)
+        # Apply layer normalization before final prediction
+        normalized_features = self.pre_action_norm(fused_features)
+        
+        # Predict action with normalized features
+        logits = self.action_head(normalized_features)  # (B, action_dim)
         
         return logits
+    
+    def generate(self, observations, temperature=1.0):
+        """
+        Generate actions for inference with sampling
+        
+        Args:
+            observations: Dictionary with 'image' and 'state' keys
+                - image: (batch_size, num_levels, 2, view_size, view_size)
+                - state: (batch_size, 2)
+            temperature: Temperature for softmax sampling (1.0 = normal, >1.0 = more random, <1.0 = more confident)
+                
+        Returns:
+            actions: (batch_size,) - sampled actions for ConvNet (single action per sample)
+        """
+        self.eval()
+        with torch.no_grad():
+            logits = self.forward(observations)  # (batch_size, action_dim)
+            
+            # Apply temperature scaling
+            if temperature != 1.0:
+                logits = logits / temperature
+            
+            # Convert to probabilities
+            probs = F.softmax(logits, dim=-1)  # (batch_size, action_dim)
+            
+            # Sample from the probability distribution
+            actions = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (batch_size,)
+            
+        return actions
 
 
 class ConvNetTrainer:
@@ -287,19 +322,30 @@ class ConvNetTrainer:
             dropout=cfg.model.dropout
         ).to(self.device)
         
-        # Optimizer and scheduler
+        # Optimizer and scheduler  
         self.optimizer = optim.Adam(
             self.model.parameters(),
             lr=cfg.training.lr,
             weight_decay=cfg.training.weight_decay
         )
         
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=cfg.training.epochs,
-            eta_min=cfg.training.lr * 0.01  # Min LR is 1% of initial
-        )
+        # Calculate warmup steps (configurable ratio of total training steps)
+        warmup_ratio = cfg.training.warmup_ratio
+        warmup_epochs = max(1, int(cfg.training.epochs * warmup_ratio))
+        total_steps = len(self.train_loader) * cfg.training.epochs
+        warmup_steps = len(self.train_loader) * warmup_epochs
+        
+        # Create warmup + cosine annealing scheduler (same pattern as ACT)
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup
+                return float(current_step) / float(max(1, warmup_steps))
+            else:
+                # Cosine annealing after warmup
+                progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                return max(0.01, 0.5 * (1 + np.cos(np.pi * progress)))  # Min LR is 1% of initial
+        
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
         
         # Loss function
         self.criterion = FocalLoss(
@@ -353,8 +399,13 @@ class ConvNetTrainer:
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # More aggressive gradient clipping and monitoring
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
             self.optimizer.step()
+            
+            # Update learning rate scheduler (per step, like ACT)
+            self.scheduler.step()
             
             # Calculate accuracy
             pred_actions = torch.argmax(logits, dim=-1)
@@ -370,7 +421,7 @@ class ConvNetTrainer:
             pbar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
                 'Acc': f'{accuracy.item():.3f}',
-                'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
+                'LR': f'{self.optimizer.param_groups[0]["lr"]:.2e}',
             })
             
             # Log to tensorboard
@@ -378,6 +429,7 @@ class ConvNetTrainer:
                 self.writer.add_scalar('train/loss', loss.item(), self.global_step)
                 self.writer.add_scalar('train/accuracy', accuracy.item(), self.global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
+                self.writer.add_scalar('train/grad_norm', grad_norm, self.global_step)
         
         avg_loss = total_loss / num_batches
         avg_acc = total_acc / num_batches
@@ -535,9 +587,6 @@ class ConvNetTrainer:
             
             # Validate
             val_loss, val_acc = self.validate(epoch)
-            
-            # Update learning rate
-            self.scheduler.step()
             
             # Log to tensorboard
             self.writer.add_scalar('epoch/train_loss', train_loss, epoch)

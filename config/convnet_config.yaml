@@ -24,6 +24,8 @@ training:
   lr: 3e-4  # Slightly higher learning rate
   weight_decay: 1e-4
   num_workers: 4  # Can use more workers since no complex data processing
+  # Learning rate schedule
+  warmup_ratio: 0.1  # 10% of total training for warmup (similar to ACT)
   # Focal loss parameters to handle class imbalance
   focal_alpha: 1.0
   focal_gamma: 2.0
